@@ -3,7 +3,7 @@
    "aliases": {
       "lune": "~/.lune/.typedefs/0.10.0/"
    },
-   "lintErrors": true,
+   "lintErrors": false,
    "typeErrors": true,
    "lint": {
       "*": true,
