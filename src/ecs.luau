@@ -48,35 +48,46 @@ export type Monitor = {
 export type Query<T...> = typeof(setmetatable(
 	{} :: {
 		is_cached: boolean,
-		with_ids: { Entity },
-		without_ids: { Entity }?,
-		terms: { Entity },
 
-		with: (...Component) -> Query<T...>,
-		without: (...Component) -> Query<T...>,
-		clone: () -> Query<T...>,
-		archetypes: () -> { Archetype },
+		with: (Query<T...>, ...Component) -> Query<T...>,
+		without: (Query<T...>, ...Component) -> Query<T...>,
+		clone: (Query<T...>) -> Query<T...>,
+		rematch: (Query<T...>) -> { Archetype },
+		archetypes: (Query<T...>) -> { Archetype },
 
-		match: (Archetype) -> boolean,
-		has: (entity: Entity) -> boolean,
-		empty: () -> boolean,
-		count: () -> number,
-		entities: () -> { Entity },
-		random: () -> Entity?,
-		first: (predicator: ((Entity, T...) -> boolean)?) -> (Entity, T...),
+		match: (Query<T...>, Archetype) -> boolean,
+		has: (Query<T...>, entity: Entity) -> boolean,
+		empty: (Query<T...>) -> boolean,
+		count: (Query<T...>) -> number,
+		entities: (Query<T...>) -> { Entity },
+		random: (Query<T...>) -> Entity?,
+		first: (Query<T...>, predicator: ((Entity, T...) -> boolean)?) -> (Entity, T...),
 
-		cached: () -> Query<T...>,
+		cached: (Query<T...>) -> Query<T...>,
 		cleanup: Cleanup,
-		iter: () -> () -> (Entity, T...),
-		update: (mapper: (entity: Entity, T...) -> T...) -> (),
+		iter: (Query<T...>) -> () -> (Entity, T...),
+		update: (Query<T...>, mapper: (entity: Entity, T...) -> T...) -> (),
 
-		monitor: () -> Monitor,
-		changed: (callback: (entity: Entity) -> ()) -> Cleanup,
+		monitor: (Query<T...>) -> Monitor,
+		changed: (Query<T...>, callback: (entity: Entity) -> ()) -> Cleanup,
 	},
 	{} :: {
 		__iter: () -> () -> (Entity, T...),
 	}
 ))
+
+export type QueryInternal = Query<any> & {
+	terms: { u53 },
+	with_ids: { u53 },
+	without_ids: { u53 }?,
+	cache_cleanup: (() -> ())?,
+
+	world: World,
+	compatible_archetypes: Array<Archetype>,
+	compatible_archetypes_map: Map<ArchetypeId, number>,
+
+	match_archetype: (QueryInternal, Archetype) -> boolean,
+}
 
 export type Archetype = {
 	archetype_id: ArchetypeId,
@@ -103,7 +114,7 @@ export type EntityRecord = {
 
 export type ComponentRecord = {
 	column_index: Map<ArchetypeId, number>,
-	id_count: Map<ArchetypeId, number>,
+	pair_count: Map<ArchetypeId, number>,
 
 	-- only defined for pair(rel, *)
 	pair_records: Map<u53, ComponentRecord>?,
@@ -259,6 +270,7 @@ local ECS_REST = MAX_COMPONENT_ID + 6
 
 local IS_COMPONENT_FLAG = bit32.lshift(1, 0)
 local IS_EXCLUSIVE_FLAG = bit32.lshift(1, 1)
+local HAS_DELETE_FLAG = bit32.lshift(1, 2)
 
 local NULL_ARRAY = table.freeze {} :: { any }
 
@@ -276,13 +288,6 @@ local function PAIR_SECOND(id: u53): u24
 	return (id - PAIR_OFFSET) % ENTITY_MASK
 end
 
-local function ECS_PAIR(first: u24, second: u24): u53
-	first %= ENTITY_MASK
-	second %= ENTITY_MASK
-
-	return second + (first * ENTITY_MASK) + PAIR_OFFSET
-end
-
 local function ENTITY_ID(e: u53): u24
 	return e % ENTITY_MASK
 end
@@ -293,6 +298,13 @@ end
 
 local function APPEND_GENERATION(id: number, generation: number): u53
 	return id + (generation * ENTITY_MASK)
+end
+
+local function ECS_PAIR(first: u24, second: u24): u53
+	first = ENTITY_ID(first)
+	second = ENTITY_ID(second)
+
+	return second + (first * ENTITY_MASK) + PAIR_OFFSET
 end
 
 local function HASH_IDS(ids: { u53 })
@@ -309,6 +321,19 @@ local function FIND_INSERT(ids: { u53 }, added: u53)
 		end
 	end
 	return #ids + 1
+end
+
+local function PREREGISTER_COMPONENT()
+	local id = MAX_COMPONENT_ID - preregistered_count
+	preregistered_count += 1
+	preregistered_components[id] = true
+	return id
+end
+
+local function PREREGISTER_TAG()
+	local id = MAX_COMPONENT_ID - preregistered_count
+	preregistered_count += 1
+	return id
 end
 
 local function SET_COMPONENT_BITSETS(component_bitsets: Map<number, Bitset>, id: number)
@@ -403,9 +428,9 @@ local function FIRE_QUERY_OBSERVERS_SET(observers_set: Map<QueryIdObserver, true
 	end
 end
 
--- monitors/observers will be accumulated in a set in bulk operations
--- to prevent them from firing multiple times when bulk operations are used.
--- multiple monitors that belong to the same query are ovewritten and fire once per query
+-- monitors/observers will be accumulated in a hashmap set for code that changes multiple components at once
+-- to prevent them from firing multiple times as a single monitor subscribes to multiple components at the same time.
+-- multiple monitors that belong to the same query are ovewritten and fired once per query
 -- its slower but keeps monitors reliable
 local function ACCUMULATE_MONITORS_SET(
 	component_record: ComponentRecord,
@@ -441,19 +466,6 @@ local function ACCUMULATE_MONITORS_SET(
 	end
 end
 
-local function PREREGISTER_COMPONENT()
-	local id = MAX_COMPONENT_ID - preregistered_count
-	preregistered_count += 1
-	preregistered_components[id] = true
-	return id
-end
-
-local function PREREGISTER_TAG()
-	local id = MAX_COMPONENT_ID - preregistered_count
-	preregistered_count += 1
-	return id
-end
-
 local function REMOVE_INSERTED_OBSERVERS<T>(inserted_in: { { T } }, observer: T)
 	for _, observers in inserted_in do
 		local index = table.find(observers, observer)
@@ -463,7 +475,12 @@ local function REMOVE_INSERTED_OBSERVERS<T>(inserted_in: { { T } }, observer: T)
 	end
 end
 
-local function MATCH_ARCHETYPES(world: World, with_ids: { number }, without_ids: { number }?, ignore_empty: boolean)
+local function FIND_MATCHED_ARCHETYPES(
+	world: World,
+	with_ids: { number },
+	without_ids: { number }?,
+	ignore_empty: boolean
+)
 	local archetypes = world.archetypes
 	local components_lookup = world.components_lookup
 
@@ -554,17 +571,12 @@ local function MATCH_ARCHETYPES(world: World, with_ids: { number }, without_ids:
 	return compatible
 end
 
-local function OBSERVE_MATCHED_ARCHETYPES(
-	world: World,
-	with_ids: { number },
-	without_ids: { number }?,
-	match: ArchetypeMatch
-)
+local function OBSERVE_MATCHED_ARCHETYPES(world: World, with_ids: { number }, without_ids: { number }?)
 	local internal = world.internal
 	local archetype_creation_observers = internal.archetype_creation_observers
 	local archetype_destruction_observers = internal.archetype_destruction_observers
 
-	local compatible_archetypes = MATCH_ARCHETYPES(world, with_ids, without_ids, false)
+	local compatible_archetypes = FIND_MATCHED_ARCHETYPES(world, with_ids, without_ids, false)
 	local compatible_archetypes_map: Map<ArchetypeId, number> = {}
 
 	local observe_id = with_ids[1]
@@ -593,12 +605,29 @@ local function OBSERVE_MATCHED_ARCHETYPES(
 		compatible_archetypes_map[last_archetype.archetype_id] = row
 	end
 
+	local function archetype_matcher(archetype: Archetype)
+		local columns_map = archetype.columns_map
+		for _, id in with_ids do
+			if not columns_map[id] then
+				return false
+			end
+		end
+		if without_ids then
+			for _, id in without_ids do
+				if columns_map[id] then
+					return false
+				end
+			end
+		end
+		return true
+	end
+
 	local creation_observer: ArchetypeObserver = {
-		match = match,
+		match = archetype_matcher,
 		callback = creation_observer_callback,
 	}
 	local destruction_observer: ArchetypeObserver = {
-		match = match,
+		match = archetype_matcher,
 		callback = destruction_observer_callback,
 	}
 
@@ -631,11 +660,10 @@ local function observer_new(
 	callback: QueryMonitorCallback,
 	terms: { u53 },
 	with_ids: { u53 },
-	without_ids: { u53 }?,
-	match: ArchetypeMatch
+	without_ids: { u53 }?
 )
 	local component_record_ensure = world.internal.component_record_ensure
-	local _, archetypes_map, observers_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids, match)
+	local _, archetypes_map, observers_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids)
 
 	local function query_match(archetype: Archetype)
 		return archetypes_map[archetype.archetype_id] ~= nil
@@ -684,9 +712,9 @@ local function observer_new(
 	end
 end
 
-local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }?, match: ArchetypeMatch)
+local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }?)
 	local component_record_ensure = world.internal.component_record_ensure
-	local _, archetypes_map, observers_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids, match)
+	local _, archetypes_map, cache_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids)
 
 	local function query_match(archetype: Archetype)
 		return archetypes_map[archetype.archetype_id] ~= nil
@@ -709,7 +737,7 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 	end
 
 	local function cleanup()
-		observers_cleanup()
+		cache_cleanup()
 		REMOVE_INSERTED_OBSERVERS(inserted_in, query_monitor)
 	end
 
@@ -741,15 +769,9 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 	return monitor
 end
 
+local query_mt = {}
+
 local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, without_ids: { u53 }?): Query<any>
-	local compatible_archetypes: { Archetype } = nil :: any
-	local compatible_archetypes_map: { [ArchetypeId]: number } = {}
-	local observers_cleanup: (() -> ())?
-
-	local components_lookup = world.components_lookup
-	local internal = world.internal
-	local get_entity_record_alive = internal.get_entity_record_alive
-
 	local query = {
 		is_cached = false,
 		with_ids = with_ids,
@@ -757,228 +779,146 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 		terms = terms,
 	}
 
-	local function match_archetype(archetype: Archetype): boolean
-		local columns_map = archetype.columns_map
-		for _, id in with_ids do
-			if not columns_map[id] then
-				return false
-			end
-		end
-		if without_ids then
-			for _, id in without_ids do
-				if columns_map[id] then
-					return false
-				end
-			end
-		end
-		return true
-	end
+	return query :: any
+end
 
-	local function query_match(archetype: Archetype): boolean
-		if query.is_cached then
-			return compatible_archetypes_map[archetype.archetype_id] ~= nil
-		else
-			return match_archetype(archetype)
-		end
+local function query_match(query: QueryInternal, archetype: Archetype)
+	if query.is_cached then
+		local compatible_archetypes_map = query.compatible_archetypes_map
+		return compatible_archetypes_map[archetype.archetype_id] ~= nil
+	else
+		return query.match_archetype(query, archetype)
 	end
+end
 
-	local function query_has(entity: u53): boolean
-		local record = get_entity_record_alive(entity)
-		if not record then
+local function query_with(query: QueryInternal) end
+
+local function query_clone(query: QueryInternal)
+	local without_ids = query.without_ids
+
+	return query_new(
+		query.world,
+		table.clone(query.terms),
+		table.clone(query.with_ids),
+		without_ids and table.clone(without_ids)
+	)
+end
+
+local function query_rematch(query: QueryInternal)
+	local world = query.world
+	local with_ids = query.with_ids
+	local without_ids = query.without_ids
+
+	local matched = FIND_MATCHED_ARCHETYPES(world, with_ids, without_ids, true)
+	query.compatible_archetypes = matched
+	return matched
+end
+
+local function query_archetypes(query: QueryInternal): { Archetype }
+	local compatible_archetypes = query.compatible_archetypes
+
+	if compatible_archetypes then
+		return compatible_archetypes
+	else
+		return query_rematch(query)
+	end
+end
+
+local function query_has(query: QueryInternal, entity: number)
+	local world = query.world
+	local internal = world.internal
+	local get_entity_record_alive = internal.get_entity_record_alive
+
+	local record = get_entity_record_alive(entity)
+	if not record then
+		return false
+	end
+	return query_match(query, record.archetype)
+end
+
+local function query_empty(query: QueryInternal): boolean
+	query_archetypes(query)
+	for _, archetype in query.compatible_archetypes do
+		if archetype.alive then
 			return false
 		end
-		return query_match(record.archetype)
 	end
+	return true
+end
 
-	local function query_with(...: u53)
-		local ids = { ... }
-		table.move(ids, 1, #ids, #with_ids + 1, with_ids)
-		return query
+local function query_count(query: QueryInternal): number
+	query_archetypes(query)
+	local count = 0
+	for _, archetype in query.compatible_archetypes do
+		count += #archetype.entities
 	end
+	return count
+end
 
-	local function query_without(...: u53)
-		local ids = { ... }
-		if without_ids then
-			table.move(ids, 1, #ids, #without_ids + 1, without_ids)
-		else
-			without_ids = ids
+local function query_entities(query: QueryInternal): { Entity }
+	query_archetypes(query)
+	local entities = {}
+	for _, archetype in query.compatible_archetypes do
+		if not archetype.alive then
+			continue
 		end
-		return query
+		local archetype_entities = archetype.entities
+		table.move(archetype_entities, 1, #archetype_entities, #entities + 1, entities)
 	end
+	return entities
+end
 
-	local function query_clone()
-		return query_new(world, table.clone(terms), table.clone(with_ids), without_ids and table.clone(without_ids))
-	end
+local function query_random(query: QueryInternal): u53?
+	local count = query_count(query)
+	local random = math.random(1, count)
 
-	local function query_archetypes(): { Archetype }
-		if not compatible_archetypes then
-			local matched = MATCH_ARCHETYPES(world, with_ids, without_ids, true)
-			compatible_archetypes = matched
-			return matched
+	for _, archetype in query.compatible_archetypes do
+		if not archetype.alive then
+			continue
 		end
-		return compatible_archetypes
-	end
-
-	local function query_empty(): boolean
-		query_archetypes()
-		for _, archetype in compatible_archetypes do
-			if archetype.alive then
-				return false
-			end
+		local entities = archetype.entities
+		local entity_count = #entities
+		if random <= entity_count then
+			return entities[random] :: any
 		end
-		return true
+		random -= entity_count
+	end
+	return nil
+end
+
+local function query_cleanup(query: QueryInternal)
+	if query.is_cached and query.cache_cleanup then
+		query.is_cached = false
+		query.cache_cleanup()
+		query.cache_cleanup = nil
+	end
+end
+
+local function query_iter(query: QueryInternal): () -> any
+	local compatible_archetypes = query_archetypes(query)
+	local iter_archetype_index = 1
+	local iter_archetype: Archetype = compatible_archetypes[iter_archetype_index]
+
+	if not iter_archetype then
+		return NOOP
 	end
 
-	local function query_count(): number
-		query_archetypes()
-		local count = 0
-		for _, archetype in compatible_archetypes do
-			count += #archetype.entities
-		end
-		return count
-	end
-
-	local function query_entities(): { Entity }
-		query_archetypes()
-		local entities = {}
-		for _, archetype in compatible_archetypes do
-			if not archetype.alive then
-				continue
-			end
-			local archetype_entities = archetype.entities
-			table.move(archetype_entities, 1, #archetype_entities, #entities + 1, entities)
-		end
-		return entities
-	end
-
-	local function query_random(): u53?
-		local count = query_count()
-		local random = math.random(1, count)
-
-		for _, archetype in compatible_archetypes do
-			if not archetype.alive then
-				continue
-			end
-			local entities = archetype.entities
-			local entity_count = #entities
-			if random <= entity_count then
-				return entities[random] :: any
-			end
-			random -= entity_count
-		end
-		return nil
-	end
-
-	local function query_cached()
-		if query.is_cached then
-			return
-		end
-		query.is_cached = true
-
-		-- stylua: ignore
-		compatible_archetypes, compatible_archetypes_map, observers_cleanup = OBSERVE_MATCHED_ARCHETYPES(
-			world, with_ids, without_ids, match_archetype
-		)
-	end
-
-	local function query_cleanup()
-		if query.is_cached and observers_cleanup then
-			query.is_cached = false
-			observers_cleanup()
-			observers_cleanup = nil
-		end
-	end
-
-	local function query_monitor(): Monitor
-		return monitor_new(world, with_ids, without_ids, match_archetype)
-	end
-
-	local function query_changed(callback: QueryMonitorCallback): Cleanup
-		return observer_new(world, callback, terms, with_ids, without_ids, match_archetype)
-	end
-
-	-- QUERY ITERATION
-
+	local terms = query.terms
 	local A, B, C, D, E, F, G, H, I = unpack(terms)
 
 	local a: Column, b: Column, c: Column, d: Column
 	local e: Column, f: Column, g: Column, h: Column
 
-	local iter_archetype_index = 1
-	local iter_archetype: Archetype
-	local iter_columns_map: { [u53]: Column }
+	local iter_columns_map = iter_archetype.columns_map
 
-	local iter_entities: { Entity }
-	local iter_entity_index = 0
+	local iter_entities = iter_archetype.entities
+	local iter_entity_row = #iter_entities
 
 	local query_iter_next
 
-	local function query_iter(): () -> any
-		iter_archetype_index = 1
-		compatible_archetypes = query_archetypes()
-		iter_archetype = compatible_archetypes[iter_archetype_index]
-
-		if not iter_archetype then
-			return NOOP
-		end
-		iter_entities = iter_archetype.entities
-		iter_entity_index = #iter_entities
-
-		iter_columns_map = iter_archetype.columns_map
-
-		if not A then
-		elseif not B then
-			a = iter_columns_map[A]
-		elseif not C then
-			a = iter_columns_map[A]
-			b = iter_columns_map[B]
-		elseif not D then
-			a = iter_columns_map[A]
-			b = iter_columns_map[B]
-			c = iter_columns_map[C]
-		elseif not E then
-			a = iter_columns_map[A]
-			b = iter_columns_map[B]
-			c = iter_columns_map[C]
-			d = iter_columns_map[D]
-		elseif not F then
-			a = iter_columns_map[A]
-			b = iter_columns_map[B]
-			c = iter_columns_map[C]
-			d = iter_columns_map[D]
-			e = iter_columns_map[E]
-		elseif not G then
-			a = iter_columns_map[A]
-			b = iter_columns_map[B]
-			c = iter_columns_map[C]
-			d = iter_columns_map[D]
-			e = iter_columns_map[E]
-			f = iter_columns_map[F]
-		elseif not H then
-			a = iter_columns_map[A]
-			b = iter_columns_map[B]
-			c = iter_columns_map[C]
-			d = iter_columns_map[D]
-			e = iter_columns_map[E]
-			f = iter_columns_map[F]
-			g = iter_columns_map[G]
-		else
-			a = iter_columns_map[A]
-			b = iter_columns_map[B]
-			c = iter_columns_map[C]
-			d = iter_columns_map[D]
-			e = iter_columns_map[E]
-			f = iter_columns_map[F]
-			g = iter_columns_map[G]
-			h = iter_columns_map[H]
-		end
-
-		return query_iter_next
-	end
-
 	if not A then
-		function query_iter_next(): Entity
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -990,15 +930,15 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 			end
-			iter_entity_index -= 1
+			iter_entity_row -= 1
 			return entity
 		end
 	elseif not B then
-		function query_iter_next(): (Entity, any)
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -1010,20 +950,20 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 				iter_columns_map = iter_archetype.columns_map
 
 				a = iter_columns_map[A]
 			end
-			local row = iter_entity_index
-			iter_entity_index -= 1
+			local row = iter_entity_row
+			iter_entity_row -= 1
 
 			return entity, a[row]
 		end
 	elseif not C then
-		function query_iter_next(): (Entity, any, any)
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -1035,21 +975,21 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 				iter_columns_map = iter_archetype.columns_map
 
 				a = iter_columns_map[A]
 				b = iter_columns_map[B]
 			end
-			local row = iter_entity_index
-			iter_entity_index -= 1
+			local row = iter_entity_row
+			iter_entity_row -= 1
 
 			return entity, a[row], b[row]
 		end
 	elseif not D then
-		function query_iter_next(): (Entity, any, any, any)
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -1061,22 +1001,22 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 				iter_columns_map = iter_archetype.columns_map
 
 				a = iter_columns_map[A]
 				b = iter_columns_map[B]
 				c = iter_columns_map[C]
 			end
-			local row = iter_entity_index
-			iter_entity_index -= 1
+			local row = iter_entity_row
+			iter_entity_row -= 1
 
 			return entity, a[row], b[row], c[row]
 		end
 	elseif not E then
-		function query_iter_next(): (Entity, any, any, any, any)
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -1088,8 +1028,8 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 				iter_columns_map = iter_archetype.columns_map
 
 				a = iter_columns_map[A]
@@ -1097,14 +1037,14 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				c = iter_columns_map[C]
 				d = iter_columns_map[D]
 			end
-			local row = iter_entity_index
-			iter_entity_index -= 1
+			local row = iter_entity_row
+			iter_entity_row -= 1
 
 			return entity, a[row], b[row], c[row], d[row]
 		end
 	elseif not F then
-		function query_iter_next(): (Entity, any, any, any, any, any)
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -1116,8 +1056,8 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 				iter_columns_map = iter_archetype.columns_map
 
 				a = iter_columns_map[A]
@@ -1126,14 +1066,14 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				d = iter_columns_map[D]
 				e = iter_columns_map[E]
 			end
-			local row = iter_entity_index
-			iter_entity_index -= 1
+			local row = iter_entity_row
+			iter_entity_row -= 1
 
 			return entity, a[row], b[row], c[row], d[row], e[row]
 		end
 	elseif not G then
-		function query_iter_next(): Entity?
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -1145,8 +1085,8 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 				iter_columns_map = iter_archetype.columns_map
 
 				a = iter_columns_map[A]
@@ -1156,14 +1096,14 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				e = iter_columns_map[E]
 				f = iter_columns_map[F]
 			end
-			local row = iter_entity_index
-			iter_entity_index -= 1
+			local row = iter_entity_row
+			iter_entity_row -= 1
 
 			return entity, a[row], b[row], c[row], d[row], e[row], f[row]
 		end
 	elseif not H then
-		function query_iter_next(): Entity?
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -1175,8 +1115,8 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 				iter_columns_map = iter_archetype.columns_map
 
 				a = iter_columns_map[A]
@@ -1187,14 +1127,14 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				f = iter_columns_map[F]
 				g = iter_columns_map[G]
 			end
-			local row = iter_entity_index
-			iter_entity_index -= 1
+			local row = iter_entity_row
+			iter_entity_row -= 1
 
 			return entity, a[row], b[row], c[row], d[row], e[row], f[row], g[row]
 		end
 	elseif not I then
-		function query_iter_next(): Entity?
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -1206,8 +1146,8 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 				iter_columns_map = iter_archetype.columns_map
 
 				a = iter_columns_map[A]
@@ -1219,8 +1159,8 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				g = iter_columns_map[G]
 				h = iter_columns_map[H]
 			end
-			local row = iter_entity_index
-			iter_entity_index -= 1
+			local row = iter_entity_row
+			iter_entity_row -= 1
 
 			return entity, a[row], b[row], c[row], d[row], e[row], f[row], g[row], h[row]
 		end
@@ -1228,8 +1168,8 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 		local rest = {}
 		local terms_count = #terms
 
-		function query_iter_next(): Entity?
-			local entity = iter_entities[iter_entity_index]
+		function query_iter_next(): ...any
+			local entity = iter_entities[iter_entity_row]
 			while entity == nil do
 				iter_archetype_index += 1
 				iter_archetype = compatible_archetypes[iter_archetype_index]
@@ -1241,8 +1181,8 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				end
 
 				iter_entities = iter_archetype.entities
-				iter_entity_index = #iter_entities
-				entity = iter_entities[iter_entity_index]
+				iter_entity_row = #iter_entities
+				entity = iter_entities[iter_entity_row]
 				iter_columns_map = iter_archetype.columns_map
 
 				a = iter_columns_map[A]
@@ -1254,8 +1194,8 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 				g = iter_columns_map[G]
 				h = iter_columns_map[H]
 			end
-			local row = iter_entity_index
-			iter_entity_index -= 1
+			local row = iter_entity_row
+			iter_entity_row -= 1
 
 			for i = 9, terms_count do
 				rest[i - 8] = iter_columns_map[terms[i]][row]
@@ -1265,8 +1205,64 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 		end
 	end
 
-	local function query_first(predicator: ((Entity, ...any) -> boolean)?): (Entity, ...any)
-		query_archetypes()
+	if not A then
+	elseif not B then
+		a = iter_columns_map[A]
+	elseif not C then
+		a = iter_columns_map[A]
+		b = iter_columns_map[B]
+	elseif not D then
+		a = iter_columns_map[A]
+		b = iter_columns_map[B]
+		c = iter_columns_map[C]
+	elseif not E then
+		a = iter_columns_map[A]
+		b = iter_columns_map[B]
+		c = iter_columns_map[C]
+		d = iter_columns_map[D]
+	elseif not F then
+		a = iter_columns_map[A]
+		b = iter_columns_map[B]
+		c = iter_columns_map[C]
+		d = iter_columns_map[D]
+		e = iter_columns_map[E]
+	elseif not G then
+		a = iter_columns_map[A]
+		b = iter_columns_map[B]
+		c = iter_columns_map[C]
+		d = iter_columns_map[D]
+		e = iter_columns_map[E]
+		f = iter_columns_map[F]
+	elseif not H then
+		a = iter_columns_map[A]
+		b = iter_columns_map[B]
+		c = iter_columns_map[C]
+		d = iter_columns_map[D]
+		e = iter_columns_map[E]
+		f = iter_columns_map[F]
+		g = iter_columns_map[G]
+	else
+		a = iter_columns_map[A]
+		b = iter_columns_map[B]
+		c = iter_columns_map[C]
+		d = iter_columns_map[D]
+		e = iter_columns_map[E]
+		f = iter_columns_map[F]
+		g = iter_columns_map[G]
+		h = iter_columns_map[H]
+	end
+
+	return query_iter_next
+end
+
+local function query_first(query: QueryInternal, predicator: ((Entity, ...any) -> boolean)?): (Entity, ...any)
+	query_archetypes(query)
+
+	local terms = query.terms
+	local compatible_archetypes = query.compatible_archetypes
+
+	if predicator then
+		local A, B, C, D, E, F, G, H, I = unpack(terms)
 
 		if not A then
 			for _, archetype in compatible_archetypes do
@@ -1278,11 +1274,7 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 
 				for row = entity_count, 1, -1 do
 					local entity = entities[row] :: any
-					if predicator then
-						if predicator(entity) then
-							return entity
-						end
-					else
+					if predicator(entity) then
 						return entity
 					end
 				end
@@ -1303,11 +1295,7 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 
 					local aa = _a[row]
 
-					if predicator then
-						if predicator(entity, aa) then
-							return entity, aa
-						end
-					else
+					if predicator(entity, aa) then
 						return entity, aa
 					end
 				end
@@ -1330,11 +1318,7 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 					local aa = _a[row]
 					local bb = _b[row]
 
-					if predicator then
-						if predicator(entity, aa, bb) then
-							return entity, aa, bb
-						end
-					else
+					if predicator(entity, aa, bb) then
 						return entity, aa, bb
 					end
 				end
@@ -1359,11 +1343,7 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 					local bb = _b[row]
 					local cc = _c[row]
 
-					if predicator then
-						if predicator(entity, aa, bb, cc) then
-							return entity, aa, bb, cc
-						end
-					else
+					if predicator(entity, aa, bb, cc) then
 						return entity, aa, bb, cc
 					end
 				end
@@ -1390,11 +1370,7 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 					local cc = _c[row]
 					local dd = _d[row]
 
-					if predicator then
-						if predicator(entity, aa, bb, cc, dd) then
-							return entity, aa, bb, cc, dd
-						end
-					else
+					if predicator(entity, aa, bb, cc, dd) then
 						return entity, aa, bb, cc, dd
 					end
 				end
@@ -1423,11 +1399,7 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 					local dd = _d[row]
 					local ee = _e[row]
 
-					if predicator then
-						if predicator(entity, aa, bb, cc, dd, ee) then
-							return entity, aa, bb, cc, dd, ee
-						end
-					else
+					if predicator(entity, aa, bb, cc, dd, ee) then
 						return entity, aa, bb, cc, dd, ee
 					end
 				end
@@ -1458,11 +1430,7 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 					local ee = _e[row]
 					local ff = _f[row]
 
-					if predicator then
-						if predicator(entity, aa, bb, cc, dd, ee, ff) then
-							return entity, aa, bb, cc, dd, ee, ff
-						end
-					else
+					if predicator(entity, aa, bb, cc, dd, ee, ff) then
 						return entity, aa, bb, cc, dd, ee, ff
 					end
 				end
@@ -1495,11 +1463,7 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 					local ff = _f[row]
 					local gg = _g[row]
 
-					if predicator then
-						if predicator(entity, aa, bb, cc, dd, ee, ff, gg) then
-							return entity, aa, bb, cc, dd, ee, ff, gg
-						end
-					else
+					if predicator(entity, aa, bb, cc, dd, ee, ff, gg) then
 						return entity, aa, bb, cc, dd, ee, ff, gg
 					end
 				end
@@ -1534,11 +1498,7 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 					local gg = _g[row]
 					local hh = _h[row]
 
-					if predicator then
-						if predicator(entity, aa, bb, cc, dd, ee, ff, gg, hh) then
-							return entity, aa, bb, cc, dd, ee, ff, gg, hh
-						end
-					else
+					if predicator(entity, aa, bb, cc, dd, ee, ff, gg, hh) then
 						return entity, aa, bb, cc, dd, ee, ff, gg, hh
 					end
 				end
@@ -1580,325 +1540,350 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 						rest[i - 8] = columns_map[terms[i]][row]
 					end
 
-					if predicator then
-						if predicator(entity, aa, bb, cc, dd, ee, ff, gg, hh, unpack(rest)) then
-							return entity, aa, bb, cc, dd, ee, ff, gg, hh, unpack(rest)
-						end
-					else
+					if predicator(entity, aa, bb, cc, dd, ee, ff, gg, hh, unpack(rest)) then
 						return entity, aa, bb, cc, dd, ee, ff, gg, hh, unpack(rest)
 					end
 				end
 			end
 		end
+	else
+		local terms_output = table.create(#terms)
+		for _, archetype in compatible_archetypes do
+			if not archetype.alive then
+				continue
+			end
+
+			local entities = archetype.entities
+			local last_row = #entities
+			local columns_map = archetype.columns_map
+
+			for index, term in terms do
+				terms_output[index] = columns_map[term][last_row]
+			end
+
+			return entities[last_row], unpack(terms_output)
+		end
 		return nil :: any
 	end
+	return nil :: any
+end
 
-	local function query_update(mapper: (Entity: Entity, ...any) -> ...any)
-		if not A then
-			-- nothing to update
-			return
-		elseif not B then
-			for _, archetype in compatible_archetypes do
-				local entities = archetype.entities
-				if not archetype.alive then
-					continue
-				end
+local function query_update(query: QueryInternal, mapper: (Entity: Entity, ...any) -> ...any)
+	query_archetypes(query)
 
-				local columns_map = archetype.columns_map
-				local _a = columns_map[A]
+	local compatible_archetypes = query.compatible_archetypes
+	local terms = query.terms
 
-				for row, entity in entities do
-					local aa = _a[row]
-					local ar = mapper(entity, aa)
+	local A, B, C, D, E, F, G, H, I = unpack(terms)
 
-					_a[row] = ar
-				end
+	if not A then
+		-- nothing to update
+		return
+	elseif not B then
+		for _, archetype in compatible_archetypes do
+			local entities = archetype.entities
+			if not archetype.alive then
+				continue
 			end
-		elseif not C then
-			for _, archetype in compatible_archetypes do
-				local entities = archetype.entities
-				if not archetype.alive then
-					continue
-				end
 
-				local columns_map = archetype.columns_map
-				local _a = columns_map[A]
-				local _b = columns_map[B]
+			local columns_map = archetype.columns_map
+			local _a = columns_map[A]
 
-				for row, entity in entities do
-					local aa = _a[row]
-					local bb = _b[row]
+			for row, entity in entities do
+				local aa = _a[row]
+				local ar = mapper(entity, aa)
 
-					local ar, br = mapper(entity, aa, bb)
-
-					_a[row] = ar
-					_b[row] = br
-				end
+				_a[row] = ar
 			end
-		elseif not D then
-			for _, archetype in compatible_archetypes do
-				local entities = archetype.entities
-				if not archetype.alive then
-					continue
-				end
-
-				local columns_map = archetype.columns_map
-				local _a = columns_map[A]
-				local _b = columns_map[B]
-				local _c = columns_map[C]
-
-				for row, entity in entities do
-					local aa = _a[row]
-					local bb = _b[row]
-					local cc = _c[row]
-
-					local ar, br, cr = mapper(entity, aa, bb, cc)
-
-					_a[row] = ar
-					_b[row] = br
-					_c[row] = cr
-				end
+		end
+	elseif not C then
+		for _, archetype in compatible_archetypes do
+			local entities = archetype.entities
+			if not archetype.alive then
+				continue
 			end
-		elseif not E then
-			for _, archetype in compatible_archetypes do
-				local entities = archetype.entities
-				if not archetype.alive then
-					continue
-				end
 
-				local columns_map = archetype.columns_map
-				local _a = columns_map[A]
-				local _b = columns_map[B]
-				local _c = columns_map[C]
-				local _d = columns_map[D]
+			local columns_map = archetype.columns_map
+			local _a = columns_map[A]
+			local _b = columns_map[B]
 
-				for row, entity in entities do
-					local aa = _a[row]
-					local bb = _b[row]
-					local cc = _c[row]
-					local dd = _d[row]
+			for row, entity in entities do
+				local aa = _a[row]
+				local bb = _b[row]
 
-					local ar, br, cr, dr = mapper(entity, aa, bb, cc, dd)
+				local ar, br = mapper(entity, aa, bb)
 
-					_a[row] = ar
-					_b[row] = br
-					_c[row] = cr
-					_d[row] = dr
-				end
+				_a[row] = ar
+				_b[row] = br
 			end
-		elseif not F then
-			for _, archetype in compatible_archetypes do
-				local entities = archetype.entities
-				if not archetype.alive then
-					continue
-				end
-
-				local columns_map = archetype.columns_map
-				local _a = columns_map[A]
-				local _b = columns_map[B]
-				local _c = columns_map[C]
-				local _d = columns_map[D]
-				local _e = columns_map[E]
-
-				for row, entity in entities do
-					local aa = _a[row]
-					local bb = _b[row]
-					local cc = _c[row]
-					local dd = _d[row]
-					local ee = _e[row]
-
-					local ar, br, cr, dr, er = mapper(entity, aa, bb, cc, dd, ee)
-
-					_a[row] = ar
-					_b[row] = br
-					_c[row] = cr
-					_d[row] = dr
-					_e[row] = er
-				end
+		end
+	elseif not D then
+		for _, archetype in compatible_archetypes do
+			local entities = archetype.entities
+			if not archetype.alive then
+				continue
 			end
-		elseif not G then
-			for _, archetype in compatible_archetypes do
-				local entities = archetype.entities
-				if not archetype.alive then
-					continue
-				end
 
-				local columns_map = archetype.columns_map
-				local _a = columns_map[A]
-				local _b = columns_map[B]
-				local _c = columns_map[C]
-				local _d = columns_map[D]
-				local _e = columns_map[E]
-				local _f = columns_map[F]
+			local columns_map = archetype.columns_map
+			local _a = columns_map[A]
+			local _b = columns_map[B]
+			local _c = columns_map[C]
 
-				for row, entity in entities do
-					local aa = _a[row]
-					local bb = _b[row]
-					local cc = _c[row]
-					local dd = _d[row]
-					local ee = _e[row]
-					local ff = _f[row]
+			for row, entity in entities do
+				local aa = _a[row]
+				local bb = _b[row]
+				local cc = _c[row]
 
-					local ar, br, cr, dr, er, fr = mapper(entity, aa, bb, cc, dd, ee, ff)
+				local ar, br, cr = mapper(entity, aa, bb, cc)
 
-					_a[row] = ar
-					_b[row] = br
-					_c[row] = cr
-					_d[row] = dr
-					_e[row] = er
-					_f[row] = fr
-				end
+				_a[row] = ar
+				_b[row] = br
+				_c[row] = cr
 			end
-		elseif not H then
-			for _, archetype in compatible_archetypes do
-				local entities = archetype.entities
-				if not archetype.alive then
-					continue
-				end
-
-				local columns_map = archetype.columns_map
-				local _a = columns_map[A]
-				local _b = columns_map[B]
-				local _c = columns_map[C]
-				local _d = columns_map[D]
-				local _e = columns_map[E]
-				local _f = columns_map[F]
-				local _g = columns_map[G]
-
-				for row, entity in entities do
-					local aa = _a[row]
-					local bb = _b[row]
-					local cc = _c[row]
-					local dd = _d[row]
-					local ee = _e[row]
-					local ff = _f[row]
-					local gg = _g[row]
-
-					local ar, br, cr, dr, er, fr, gr = mapper(entity, aa, bb, cc, dd, ee, ff, gg)
-
-					_a[row] = ar
-					_b[row] = br
-					_c[row] = cr
-					_d[row] = dr
-					_e[row] = er
-					_f[row] = fr
-					_g[row] = gr
-				end
+		end
+	elseif not E then
+		for _, archetype in compatible_archetypes do
+			local entities = archetype.entities
+			if not archetype.alive then
+				continue
 			end
-		elseif not I then
-			for _, archetype in compatible_archetypes do
-				local entities = archetype.entities
-				if not archetype.alive then
-					continue
-				end
 
-				local columns_map = archetype.columns_map
-				local _a = columns_map[A]
-				local _b = columns_map[B]
-				local _c = columns_map[C]
-				local _d = columns_map[D]
-				local _e = columns_map[E]
-				local _f = columns_map[F]
-				local _g = columns_map[G]
-				local _h = columns_map[H]
+			local columns_map = archetype.columns_map
+			local _a = columns_map[A]
+			local _b = columns_map[B]
+			local _c = columns_map[C]
+			local _d = columns_map[D]
 
-				for row, entity in entities do
-					local aa = _a[row]
-					local bb = _b[row]
-					local cc = _c[row]
-					local dd = _d[row]
-					local ee = _e[row]
-					local ff = _f[row]
-					local gg = _g[row]
-					local hh = _h[row]
+			for row, entity in entities do
+				local aa = _a[row]
+				local bb = _b[row]
+				local cc = _c[row]
+				local dd = _d[row]
 
-					local ar, br, cr, dr, er, fr, gr, hr = mapper(entity, aa, bb, cc, dd, ee, ff, gg, hh)
+				local ar, br, cr, dr = mapper(entity, aa, bb, cc, dd)
 
-					_a[row] = ar
-					_b[row] = br
-					_c[row] = cr
-					_d[row] = dr
-					_e[row] = er
-					_f[row] = fr
-					_g[row] = gr
-					_h[row] = hr
-				end
+				_a[row] = ar
+				_b[row] = br
+				_c[row] = cr
+				_d[row] = dr
 			end
-		else
-			local rest = {}
-			local terms_count = #terms
+		end
+	elseif not F then
+		for _, archetype in compatible_archetypes do
+			local entities = archetype.entities
+			if not archetype.alive then
+				continue
+			end
 
-			for _, archetype in compatible_archetypes do
-				local entities = archetype.entities
-				if not archetype.alive then
-					continue
+			local columns_map = archetype.columns_map
+			local _a = columns_map[A]
+			local _b = columns_map[B]
+			local _c = columns_map[C]
+			local _d = columns_map[D]
+			local _e = columns_map[E]
+
+			for row, entity in entities do
+				local aa = _a[row]
+				local bb = _b[row]
+				local cc = _c[row]
+				local dd = _d[row]
+				local ee = _e[row]
+
+				local ar, br, cr, dr, er = mapper(entity, aa, bb, cc, dd, ee)
+
+				_a[row] = ar
+				_b[row] = br
+				_c[row] = cr
+				_d[row] = dr
+				_e[row] = er
+			end
+		end
+	elseif not G then
+		for _, archetype in compatible_archetypes do
+			local entities = archetype.entities
+			if not archetype.alive then
+				continue
+			end
+
+			local columns_map = archetype.columns_map
+			local _a = columns_map[A]
+			local _b = columns_map[B]
+			local _c = columns_map[C]
+			local _d = columns_map[D]
+			local _e = columns_map[E]
+			local _f = columns_map[F]
+
+			for row, entity in entities do
+				local aa = _a[row]
+				local bb = _b[row]
+				local cc = _c[row]
+				local dd = _d[row]
+				local ee = _e[row]
+				local ff = _f[row]
+
+				local ar, br, cr, dr, er, fr = mapper(entity, aa, bb, cc, dd, ee, ff)
+
+				_a[row] = ar
+				_b[row] = br
+				_c[row] = cr
+				_d[row] = dr
+				_e[row] = er
+				_f[row] = fr
+			end
+		end
+	elseif not H then
+		for _, archetype in compatible_archetypes do
+			local entities = archetype.entities
+			if not archetype.alive then
+				continue
+			end
+
+			local columns_map = archetype.columns_map
+			local _a = columns_map[A]
+			local _b = columns_map[B]
+			local _c = columns_map[C]
+			local _d = columns_map[D]
+			local _e = columns_map[E]
+			local _f = columns_map[F]
+			local _g = columns_map[G]
+
+			for row, entity in entities do
+				local aa = _a[row]
+				local bb = _b[row]
+				local cc = _c[row]
+				local dd = _d[row]
+				local ee = _e[row]
+				local ff = _f[row]
+				local gg = _g[row]
+
+				local ar, br, cr, dr, er, fr, gr = mapper(entity, aa, bb, cc, dd, ee, ff, gg)
+
+				_a[row] = ar
+				_b[row] = br
+				_c[row] = cr
+				_d[row] = dr
+				_e[row] = er
+				_f[row] = fr
+				_g[row] = gr
+			end
+		end
+	elseif not I then
+		for _, archetype in compatible_archetypes do
+			local entities = archetype.entities
+			if not archetype.alive then
+				continue
+			end
+
+			local columns_map = archetype.columns_map
+			local _a = columns_map[A]
+			local _b = columns_map[B]
+			local _c = columns_map[C]
+			local _d = columns_map[D]
+			local _e = columns_map[E]
+			local _f = columns_map[F]
+			local _g = columns_map[G]
+			local _h = columns_map[H]
+
+			for row, entity in entities do
+				local aa = _a[row]
+				local bb = _b[row]
+				local cc = _c[row]
+				local dd = _d[row]
+				local ee = _e[row]
+				local ff = _f[row]
+				local gg = _g[row]
+				local hh = _h[row]
+
+				local ar, br, cr, dr, er, fr, gr, hr = mapper(entity, aa, bb, cc, dd, ee, ff, gg, hh)
+
+				_a[row] = ar
+				_b[row] = br
+				_c[row] = cr
+				_d[row] = dr
+				_e[row] = er
+				_f[row] = fr
+				_g[row] = gr
+				_h[row] = hr
+			end
+		end
+	else
+		local rest = {}
+		local terms_count = #terms
+
+		for _, archetype in compatible_archetypes do
+			local entities = archetype.entities
+			if not archetype.alive then
+				continue
+			end
+
+			local columns_map = archetype.columns_map
+			local _a = columns_map[A]
+			local _b = columns_map[B]
+			local _c = columns_map[C]
+			local _d = columns_map[D]
+			local _e = columns_map[E]
+			local _f = columns_map[F]
+			local _g = columns_map[G]
+			local _h = columns_map[H]
+
+			for row, entity in entities do
+				local aa = _a[row]
+				local bb = _b[row]
+				local cc = _c[row]
+				local dd = _d[row]
+				local ee = _e[row]
+				local ff = _f[row]
+				local gg = _g[row]
+				local hh = _h[row]
+
+				for i = 9, terms_count do
+					rest[i - 8] = columns_map[terms[i]][row]
 				end
 
-				local columns_map = archetype.columns_map
-				local _a = columns_map[A]
-				local _b = columns_map[B]
-				local _c = columns_map[C]
-				local _d = columns_map[D]
-				local _e = columns_map[E]
-				local _f = columns_map[F]
-				local _g = columns_map[G]
-				local _h = columns_map[H]
+				local values = { mapper(entity, aa, bb, cc, dd, ee, ff, gg, hh, unpack(rest)) }
 
-				for row, entity in entities do
-					local aa = _a[row]
-					local bb = _b[row]
-					local cc = _c[row]
-					local dd = _d[row]
-					local ee = _e[row]
-					local ff = _f[row]
-					local gg = _g[row]
-					local hh = _h[row]
+				_a[row] = values[1]
+				_b[row] = values[2]
+				_c[row] = values[3]
+				_d[row] = values[4]
+				_e[row] = values[5]
+				_f[row] = values[6]
+				_g[row] = values[7]
+				_h[row] = values[8]
 
-					for i = 9, terms_count do
-						rest[i - 8] = columns_map[terms[i]][row]
-					end
-
-					local values = { mapper(entity, aa, bb, cc, dd, ee, ff, gg, hh, unpack(rest)) }
-
-					_a[row] = values[1]
-					_b[row] = values[2]
-					_c[row] = values[3]
-					_d[row] = values[4]
-					_e[row] = values[5]
-					_f[row] = values[6]
-					_g[row] = values[7]
-					_h[row] = values[8]
-
-					for i = 9, terms_count do
-						columns_map[terms[i]][row] = values[i]
-					end
+				for i = 9, terms_count do
+					columns_map[terms[i]][row] = values[i]
 				end
 			end
 		end
 	end
+end
 
-	query.with = query_with
-	query.without = query_without
-	query.clone = query_clone
-	query.archetypes = query_archetypes
+local function query_cached(query: QueryInternal)
+	if query.is_cached then
+		return
+	end
+	query.is_cached = true
+	local with_ids = query.with_ids
+	local without_ids = query.without_ids
 
-	query.match = query_match
-	query.has = query_has
-	query.empty = query_empty
-	query.count = query_count
-	query.entities = query_entities
-	query.random = query_random
-	query.first = query_first
+	local function match_archetype() end
 
-	query.cached = query_cached
-	query.cleanup = query_cleanup
-	query.iter = query_iter
-	query.update = query_update
+	-- stylua: ignore
+	local compatible_archetypes, compatible_archetypes_map, cleanup = OBSERVE_MATCHED_ARCHETYPES(
+		query.world, with_ids, without_ids
+	)
+	query.compatible_archetypes = compatible_archetypes
+	query.compatible_archetypes_map = compatible_archetypes_map
+	query.cache_cleanup = cleanup
+end
 
-	query.monitor = query_monitor
-	query.changed = query_changed
+local function query_monitor(query: QueryInternal)
+	return monitor_new(query.world, query.with_ids, query.without_ids)
+end
 
-	return query :: any
+local function query_changed(query: QueryInternal, callback: QueryMonitorCallback)
+	return observer_new(query.world, callback, query.terms, query.with_ids, query.without_ids)
 end
 
 local function world_new()
@@ -2083,7 +2068,7 @@ local function world_new()
 
 		local record: ComponentRecord = {
 			column_index = {},
-			id_count = {},
+			pair_count = {},
 			pair_records = nil,
 
 			archetype_count = 0,
@@ -2107,32 +2092,26 @@ local function world_new()
 		return component_record_create(id)
 	end
 
-	local function fire_created_archetype(archetype: Archetype)
-		local columns_map = archetype.columns_map
-		for id in columns_map do
-			local observers = archetype_creation_observers[id]
-			if not observers then
-				continue
-			end
-			for _, observer in observers do
-				if observer.match(archetype) then
-					observer.callback(archetype)
-				end
+	local function fire_created_archetype(archetype: Archetype, id: u53)
+		local observers = archetype_creation_observers[id]
+		if not observers then
+			return
+		end
+		for _, observer in observers do
+			if observer.match(archetype) then
+				observer.callback(archetype)
 			end
 		end
 	end
 
-	local function fire_destroyed_archetype(archetype: Archetype)
-		local columns_map = archetype.columns_map
-		for id in columns_map do
-			local observers = archetype_destruction_observers[id]
-			if not observers then
-				continue
-			end
-			for _, observer in observers do
-				if observer.match(archetype) then
-					observer.callback(archetype)
-				end
+	local function fire_destroyed_archetype(archetype: Archetype, id: u53)
+		local observers = archetype_destruction_observers[id]
+		if not observers then
+			return
+		end
+		for _, observer in observers do
+			if observer.match(archetype) then
+				observer.callback(archetype)
 			end
 		end
 	end
@@ -2143,14 +2122,14 @@ local function world_new()
 		index: number
 	): boolean
 		local column_index = record.column_index
-		local id_count = record.id_count
+		local pair_count = record.pair_count
 
 		if not column_index[archetype_id] then
 			column_index[archetype_id] = index
-			id_count[archetype_id] = 1
+			pair_count[archetype_id] = 1
 			return true
 		else
-			id_count[archetype_id] += 1
+			pair_count[archetype_id] += 1
 			return false
 		end
 	end
@@ -2281,6 +2260,41 @@ local function world_new()
 		end
 	end
 
+	local function archetype_destroy(archetype: Archetype)
+		if archetype == ROOT_ARCHETYPE then
+			return
+		end
+		local archetype_id = archetype.archetype_id
+
+		local forward_edges = archetype.forward_edges
+		local backward_edges = archetype.backward_edges
+
+		for id, edge_archetype in forward_edges do
+			edge_archetype.backward_edges[id] = nil
+			forward_edges[id] = nil
+		end
+		for id, edge_archetype in backward_edges do
+			edge_archetype.forward_edges[id] = nil
+			backward_edges[id] = nil
+		end
+
+		archetypes[archetype_id] = nil
+		archetypes_lookup[archetype.hash] = nil
+
+		for id in archetype.columns_map do
+			local component_record = components_lookup[id]
+			component_record.column_index[archetype_id] = nil
+			component_record.pair_count[archetype_id] = nil
+			component_record.archetype_count -= 1
+
+			if component_record.archetype_count == 0 then
+				components_lookup[id] = nil
+			end
+
+			fire_destroyed_archetype(archetype, id)
+		end
+	end
+
 	local function archetype_create(ids: { u53 }, hash: string): Archetype
 		local archetype_id = archetypes_count + 1
 		archetypes_count = archetype_id
@@ -2350,6 +2364,10 @@ local function world_new()
 
 		archetypes[archetype_id] = archetype
 		archetypes_lookup[hash] = archetype
+
+		for id in columns_map do
+			fire_created_archetype(archetype, id)
+		end
 
 		return archetype
 	end
@@ -2553,9 +2571,39 @@ local function world_new()
 		end
 	end
 
-	local function world_delete(entity: u53) end
+	local function world_delete(entity: u53)
+		local record = get_entity_record_asserts_alive(entity)
+		if not record then
+			return
+		end
+		if record.deleting then
+			error "attempted to destroy an entity twice"
+		end
 
-	local function world_wipe(component: u53)
+		local component_record = components_lookup[entity]
+		local relation_record = components_lookup[ECS_PAIR(entity, ECS_WILDCARD)]
+		local target_record = components_lookup[ECS_PAIR(ECS_WILDCARD, entity)]
+
+		if component_record then
+			local has_delete = CHECK_FLAG(component_record.flags, HAS_DELETE_FLAG)
+			if has_delete then
+				for archetype_id in component_record.column_index do
+					local archetype = archetypes[archetype_id]
+					local entities = archetype.entities
+					local last_row = #entities
+
+					for row = last_row, 1, -1 do
+						local entity = entities[last_row]
+						world_delete(entity :: any)
+					end
+
+					archetype_destroy(archetype)
+				end
+			end
+		end
+	end
+
+	local function world_wipe(component: u53, cleanup: boolean?)
 		local component_record = components_lookup[component]
 		if not component_record then
 			return
@@ -2572,54 +2620,15 @@ local function world_new()
 			end
 			local destination = archetype_find_without(source, component)
 
-			local should_fire = false
-			local monitors_added: { QueryIdMonitor }? = nil
-			local monitors_removed: { QueryIdMonitor }? = nil
-			local valid_observers: { QueryIdObserver }? = nil
-
-			if monitors then
-				monitors_added = {}
-				monitors_removed = {}
-
-				for _, monitor in monitors do
-					local match = monitor.match
-					local matched_before = match(source)
-					local matched_after = match(destination)
-
-					if matched_before ~= matched_after then
-						if matched_before then
-							local removed = monitor.removed
-							if removed then
-								table.insert(monitors_removed, monitor)
-								should_fire = true
-							end
-						else
-							local added = monitor.added
-							if added then
-								table.insert(monitors_added, monitor)
-								should_fire = true
-							end
-						end
-					end
-				end
-			end
-
-			if observers_added then
-				valid_observers = {}
-				for _, observer in observers_added do
-					if observer.match(destination) then
-						table.insert(valid_observers, observer)
-						should_fire = true
-					end
-				end
-			end
-
 			local source_entities = source.entities
 			local columns_map = source.columns_map
 			local destination_columns = destination.columns
 			local destination_components = destination.components
 
+			-- array lookup that maps destinations columns to source columns with 1/1 indexes
+			-- should be faster to iterate and index than a hashmap
 			local columns_array_map = table.create(#destination_components) :: Array<Column>
+
 			for index, id in destination_components do
 				local column = columns_map[id]
 				columns_array_map[index] = column
@@ -2628,6 +2637,7 @@ local function world_new()
 			local post_removed_callbacks: Array<{ () -> () }>
 
 			for row, entity in source_entities do
+				local entity = source_entities[row]
 				if on_removed then
 					local post_removed = FIRE_REMOVE_HOOKS(on_removed, entity :: any, component)
 					if post_removed then
@@ -2650,8 +2660,12 @@ local function world_new()
 				end
 			end
 
-			source.alive = false
+			-- we do this so we keep the original entities table so we can iterate it later for the observers
+			-- the alternative is cloning the entities table, or fire the observers inside the loop
+			-- but that would mean removing the entities and columns entries one by one, instead of using table.clear
+			-- this shouldnt be a problem as nothing holds the entities array (I think?)
 			source.entities = {}
+			source.alive = false
 
 			for _, column in source.columns do
 				if column ~= NULL_ARRAY then
@@ -2659,20 +2673,36 @@ local function world_new()
 				end
 			end
 
-			if should_fire then
-				for _, entity in source_entities do
-					if monitors_added then
-						for _, monitor in monitors_removed :: { QueryIdMonitor } do
-							local removed = monitor.removed :: (Entity) -> ()
-							removed(entity)
-						end
-						for _, monitor in monitors_added :: { QueryIdMonitor } do
-							local added = monitor.added :: (Entity) -> ()
-							added(entity)
+			if monitors then
+				for _, monitor in monitors do
+					local match = monitor.match
+					local matched_before = match(source)
+					local matched_after = match(destination)
+
+					if matched_before ~= matched_after then
+						if matched_before then
+							local removed = monitor.removed
+							if removed then
+								for _, entity in source_entities do
+									removed(entity :: any)
+								end
+							end
+						else
+							local added = monitor.added
+							if added then
+								for _, entity in source_entities do
+									added(entity :: any)
+								end
+							end
 						end
 					end
-					if valid_observers then
-						for _, observer in valid_observers :: { QueryIdObserver } do
+				end
+			end
+
+			if observers_added then
+				for _, observer in observers_added do
+					if observer.match(destination) then
+						for _, entity in source_entities do
 							observer.callback(entity :: any)
 						end
 					end
@@ -3049,9 +3079,9 @@ local function world_new()
 
 		local archetype = record.archetype
 		local archetype_id = archetype.archetype_id
-		local relation_wildcard = ECS_PAIR(ENTITY_ID(relation), ECS_WILDCARD)
+		local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
 		local pair_record = components_lookup[relation_wildcard]
-		local pair_count = pair_record.id_count[archetype_id]
+		local pair_count = pair_record.pair_count[archetype_id]
 
 		if not pair_count then
 			return nil
@@ -3074,9 +3104,9 @@ local function world_new()
 
 		local archetype = record.archetype
 		local archetype_id = archetype.archetype_id
-		local relation_wildcard = ECS_PAIR(ENTITY_ID(relation), ECS_WILDCARD)
+		local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
 		local pair_record = components_lookup[relation_wildcard]
-		local pair_count = pair_record.id_count[archetype_id]
+		local pair_count = pair_record.pair_count[archetype_id]
 
 		if not pair_count then
 			return NOOP :: () -> u53
