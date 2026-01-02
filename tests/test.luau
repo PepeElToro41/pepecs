@@ -4,6 +4,7 @@ local ecs = require "../src/ecs"
 local it = testkit.test()
 local TEST, CASE = it.TEST, it.CASE
 local CHECK, FINISH = it.CHECK, it.FINISH
+local FOCUS = it.FOCUS
 
 TEST("world.query()", function()
 	do
@@ -19,7 +20,13 @@ TEST("world.query()", function()
 		world.set(e2, A, "A")
 		world.set(e2, B, "B")
 
-		for e, a in world.query().with(A).iter() do
+		local n1 = world.entity()
+		local n2 = world.entity()
+		world.set(n1, B, "B")
+		world.set(n2, B, "B")
+
+		local counter = 0
+		for e, a in world.query():with(A):iter() do
 			CHECK(e == e1 or e == e2)
 			CHECK(a == nil)
 			if e == e1 then
@@ -28,13 +35,19 @@ TEST("world.query()", function()
 			elseif e == e2 then
 				CHECK(world.has(e2, A, B))
 			end
+			counter += 1
 		end
-		for e, a in world.query().with(A).without(B).iter() do
+		CHECK(counter == 2)
+
+		counter = 0
+		for e, a in world.query():with(A):without(B):iter() do
 			CHECK(e == e1)
 			CHECK(a == nil)
 			CHECK(world.has(e1, A))
 			CHECK(not world.has(e1, B))
+			counter += 1
 		end
+		CHECK(counter == 1)
 	end
 
 	do
@@ -49,7 +62,7 @@ TEST("world.query()", function()
 		world.set(e, C, true)
 		local q = world.query(A, B, C)
 		local counter = 0
-		for x, a, b, c in q.iter() do
+		for x, a, b, c in q:iter() do
 			counter += 1
 			CHECK(a)
 			CHECK(b)
@@ -67,10 +80,10 @@ TEST("world.query()", function()
 		world.add(e, B)
 		local q = world.query(A, B)
 		local counter = 0
-		for x in q.iter() do
+		for x in q:iter() do
 			counter += 1
 		end
-		for x in q.iter() do
+		for x in q:iter() do
 			counter += 1
 		end
 		CHECK(counter == 2)
@@ -83,7 +96,7 @@ TEST("world.query()", function()
 
 		world.add(e, A)
 		local count = 0
-		for id, a in world.query(A).iter() do
+		for id, a in world.query(A):iter() do
 			count += 1
 			CHECK(a == nil)
 		end

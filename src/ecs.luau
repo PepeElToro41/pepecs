@@ -69,7 +69,7 @@ export type Query<T...> = typeof(setmetatable(
 		update: (Query<T...>, mapper: (entity: Entity, T...) -> T...) -> (),
 
 		monitor: (Query<T...>) -> Monitor,
-		changed: (Query<T...>, callback: (entity: Entity) -> ()) -> Cleanup,
+		observe: (Query<T...>, callback: (entity: Entity) -> ()) -> Cleanup,
 	},
 	{} :: {
 		__iter: () -> () -> (Entity, T...),
@@ -401,6 +401,35 @@ local function FIRE_MONITOR(monitor: QueryIdMonitor, entity: u53, source: Archet
 			local added = monitor.added
 			if added then
 				added(entity)
+			end
+		end
+	end
+end
+
+local function FIRE_MONITOR_ENTITIES(
+	monitor: QueryIdMonitor,
+	entities: { u53 },
+	source: Archetype,
+	destination: Archetype
+)
+	local match = monitor.match
+	local matched_before = match(source)
+	local matched_after = match(destination)
+
+	if matched_before ~= matched_after then
+		if matched_before then
+			local removed = monitor.removed
+			if removed then
+				for _, entity in entities do
+					removed(entity)
+				end
+			end
+		else
+			local added = monitor.added
+			if added then
+				for _, entity in entities do
+					added(entity)
+				end
 			end
 		end
 	end
@@ -770,16 +799,19 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 end
 
 local query_mt = {}
+query_mt.__index = query_mt
 
 local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, without_ids: { u53 }?): Query<any>
 	local query = {
 		is_cached = false,
+
+		terms = terms,
 		with_ids = with_ids,
 		without_ids = without_ids,
-		terms = terms,
+		world = world,
 	}
 
-	return query :: any
+	return setmetatable(query, query_mt) :: any
 end
 
 local function query_match(query: QueryInternal, archetype: Archetype)
@@ -791,7 +823,24 @@ local function query_match(query: QueryInternal, archetype: Archetype)
 	end
 end
 
-local function query_with(query: QueryInternal) end
+local function query_with(query: QueryInternal, ...: u53)
+	local ids = { ... }
+	local with_ids = query.with_ids
+	table.move(ids, 1, #ids, #with_ids + 1, with_ids)
+	return query
+end
+
+local function query_without(query: QueryInternal, ...: u53)
+	local ids = { ... }
+	local without_ids = query.without_ids
+
+	if without_ids then
+		table.move(ids, 1, #ids, #without_ids + 1, without_ids)
+	else
+		query.without_ids = ids
+	end
+	return query
+end
 
 local function query_clone(query: QueryInternal)
 	local without_ids = query.without_ids
@@ -1882,9 +1931,31 @@ local function query_monitor(query: QueryInternal)
 	return monitor_new(query.world, query.with_ids, query.without_ids)
 end
 
-local function query_changed(query: QueryInternal, callback: QueryMonitorCallback)
+local function query_observe(query: QueryInternal, callback: QueryMonitorCallback)
 	return observer_new(query.world, callback, query.terms, query.with_ids, query.without_ids)
 end
+
+query_mt.with = query_with
+query_mt.without = query_without
+query_mt.clone = query_clone
+query_mt.rematch = query_clone
+query_mt.archetypes = query_clone
+
+query_mt.match = query_match
+query_mt.has = query_has
+query_mt.empty = query_empty
+query_mt.entities = query_entities
+query_mt.random = query_random
+query_mt.first = query_first
+
+query_mt.cached = query_cached
+query_mt.cleanup = query_cleanup
+query_mt.iter = query_iter
+query_mt.__iter = query_iter
+query_mt.update = query_update
+
+query_mt.monitor = query_monitor
+query_mt.observe = query_observe
 
 local function world_new()
 	local dense_arr = {}
@@ -1977,10 +2048,12 @@ local function world_new()
 
 		if alive >= count then
 			local next_id = count + 1
-			local new_record = {
+			local new_record: EntityRecord = {
 				dense = next_id,
 				archetype = ROOT_ARCHETYPE,
-			} :: EntityRecord
+				archetype_row = -1,
+				deleting = false,
+			}
 			table.insert(sparse_arr, new_record)
 			table.insert(dense_arr, next_id)
 			entity_index.alive = next_id
@@ -2201,7 +2274,9 @@ local function world_new()
 
 		if source_row == last_source_row then
 			source_entities[last_source_row] = nil
-			source.alive = false
+			if last_source_row == 1 then
+				source.alive = false
+			end
 		else
 			local swapped_entity: u53 = source_entities[last_source_row] :: any
 			source_entities[source_row] = swapped_entity :: any
@@ -2439,6 +2514,59 @@ local function world_new()
 		end
 	end
 
+	local function archetype_bulk_move_entities(source: Archetype, destination: Archetype, entities: { u53 })
+		local destination_entities = destination.entities
+
+		local source_last_row = #entities
+		local destination_last_row = #destination_entities
+
+		local columns_map = source.columns_map
+		local destination_columns = destination.columns
+
+		for row, entity in entities do
+			local record = get_entity_record(entity) :: EntityRecord
+			record.archetype = destination
+			record.archetype_row = destination_last_row + row
+		end
+
+		if destination == ROOT_ARCHETYPE then
+			for _, entity in entities do
+				local record = get_entity_record(entity) :: EntityRecord
+				record.archetype = ROOT_ARCHETYPE
+				record.archetype_row = -1
+			end
+		else
+			for row, entity in entities do
+				local record = get_entity_record(entity) :: EntityRecord
+				record.archetype = destination
+				record.archetype_row = destination_last_row + row
+			end
+
+			table.move(entities :: { Entity }, 1, source_last_row, destination_last_row + 1, destination_entities)
+			for id, destination_column in destination_columns do
+				local column = columns_map[id]
+				table.move(column, 1, source_last_row, destination_last_row + 1, destination_column)
+			end
+
+			if destination_last_row == 0 then
+				destination.alive = true
+			end
+		end
+
+		-- we do this so we keep the original entities table so we can iterate it later for the observers
+		-- the alternative is cloning the entities table, or fire the observers inside the loop
+		-- but that would mean removing the entities and columns entries one by one, instead of using table.clear
+		-- this shouldnt be a problem as nothing holds the entities array
+		source.entities = {}
+		source.alive = false
+
+		for _, column in source.columns do
+			if column ~= NULL_ARRAY then
+				table.clear(column)
+			end
+		end
+	end
+
 	local function world_entity(): u53
 		return get_new_entity_id()
 	end
@@ -2571,6 +2699,141 @@ local function world_new()
 		end
 	end
 
+	local function archetype_bulk_components_wipe(
+		archetype: Archetype,
+		entities: { u53 },
+		ids: Map<u53, ComponentRecord>
+	)
+		local destination_ids = table.clone(archetype.components)
+		for id in ids do
+			local at = table.find(destination_ids, id)
+			table.remove(destination_ids, at)
+		end
+
+		local destination = archetype_ensure(destination_ids)
+
+		local post_removed_callbacks: Array<{ () -> () }>
+		local monitors_set: Map<QueryIdMonitor, true> = {}
+		local observers_added_set: Map<QueryIdObserver, true> = {}
+
+		for id, component_record in ids do
+			ACCUMULATE_MONITORS_SET(component_record, monitors_set, observers_added_set)
+
+			local removed_hooks = component_record.on_removed
+			if removed_hooks then
+				for row, entity in entities do
+					local post_removed = FIRE_REMOVE_HOOKS(removed_hooks, entity, id)
+					if post_removed then
+						if post_removed_callbacks then
+							table.insert(post_removed_callbacks, post_removed)
+						else
+							post_removed_callbacks = { post_removed }
+						end
+					end
+				end
+			end
+		end
+
+		archetype_bulk_move_entities(archetype, destination, entities)
+
+		for monitor in monitors_set do
+			FIRE_MONITOR_ENTITIES(monitor, entities, archetype, destination)
+		end
+
+		for observer in observers_added_set do
+			if observer.match(destination) then
+				for _, entity in entities do
+					observer.callback(entity)
+				end
+			end
+		end
+
+		if post_removed_callbacks then
+			for _, post_removed in post_removed_callbacks do
+				for _, callback in post_removed do
+					callback()
+				end
+			end
+		end
+	end
+
+	local function archetype_component_wipe(
+		archetype: Archetype,
+		id: u53,
+		entities: { u53 },
+		on_removed: { RemovedHook }?,
+		monitors: { QueryIdMonitor }?,
+		observers_added: { QueryIdObserver }?
+	)
+		local destination = archetype_find_without(archetype, id)
+		local post_removed_callbacks: Array<{ () -> () }>
+
+		if on_removed then
+			-- we fire hooks before we screw the archetypes this bad
+			for _, entity in entities do
+				local post_removed = FIRE_REMOVE_HOOKS(on_removed, entity, id)
+				if post_removed then
+					if post_removed_callbacks then
+						table.insert(post_removed_callbacks, post_removed)
+					else
+						post_removed_callbacks = { post_removed }
+					end
+				end
+			end
+		end
+
+		archetype_bulk_move_entities(archetype, destination, entities)
+
+		if monitors then
+			for _, monitor in monitors do
+				FIRE_MONITOR_ENTITIES(monitor, entities, archetype, destination)
+			end
+		end
+
+		if observers_added then
+			for _, observer in observers_added do
+				if observer.match(destination) then
+					for _, entity in entities do
+						observer.callback(entity)
+					end
+				end
+			end
+		end
+
+		if post_removed_callbacks then
+			for _, post_removed in post_removed_callbacks :: Array<{ () -> () }> do
+				for _, callback in post_removed do
+					callback()
+				end
+			end
+		end
+	end
+
+	local function component_record_wipe(component_record: ComponentRecord, id: u53, destroy_archetypes: boolean?)
+		local on_removed = component_record.on_removed
+		local monitors = component_record.monitors
+		local observers_added = component_record.observers_added
+
+		if destroy_archetypes then
+			for archetype_id in component_record.column_index do
+				local source = archetypes[archetype_id]
+				if not source.alive then
+					continue
+				end
+				archetype_component_wipe(source, id, source.entities :: { any }, on_removed, monitors, observers_added)
+				archetype_destroy(source)
+			end
+		else
+			for archetype_id in component_record.column_index do
+				local source = archetypes[archetype_id]
+				if not source.alive then
+					continue
+				end
+				archetype_component_wipe(source, id, source.entities :: { any }, on_removed, monitors, observers_added)
+			end
+		end
+	end
+
 	local function world_delete(entity: u53)
 		local record = get_entity_record_asserts_alive(entity)
 		if not record then
@@ -2599,124 +2862,73 @@ local function world_new()
 
 					archetype_destroy(archetype)
 				end
+			else
+				component_record_wipe(component_record, entity, true)
 			end
+		end
+		if target_record then
+			local removing: Map<u53, ComponentRecord> = {}
+
+			for archetype_id in target_record.column_index do
+				local archetype = archetypes[archetype_id]
+				local deleted_any = false
+				local entities: { u53 } = archetype.entities :: any
+				local removing_count = 0
+
+				for _, id in archetype.components do
+					if not IS_PAIR(id) then
+						continue
+					end
+					if get_entity_any(PAIR_SECOND(id)) ~= entity then
+						continue
+					end
+
+					local id_record = components_lookup[id]
+					local has_delete = CHECK_FLAG(id_record.flags, HAS_DELETE_FLAG)
+
+					if has_delete then
+						for row = #entities, 1, -1 do
+							local entity = entities[row]
+							world_delete(entity)
+						end
+
+						deleted_any = true
+						break
+					else
+						removing[id] = id_record
+						removing_count += 1
+					end
+				end
+
+				if deleted_any then
+					continue
+				end
+
+				if removing_count == 1 then
+					for id, id_record in removing do
+						local on_removed = id_record.on_removed
+						local monitors = id_record.monitors
+						local observers_added = id_record.observers_added
+						archetype_component_wipe(archetype, id, entities, on_removed, monitors, observers_added)
+					end
+				else
+					archetype_bulk_components_wipe(archetype, entities, removing)
+				end
+
+				table.clear(removing)
+				archetype_destroy(archetype)
+			end
+		end
+		if relation_record then
 		end
 	end
 
-	local function world_wipe(component: u53, cleanup: boolean?)
-		local component_record = components_lookup[component]
+	local function world_wipe(id: u53)
+		local component_record = components_lookup[id]
 		if not component_record then
 			return
 		end
-
-		local on_removed = component_record.on_removed
-		local monitors = component_record.monitors
-		local observers_added = component_record.observers_added
-
-		for archetype_id in component_record.column_index do
-			local source = archetypes[archetype_id]
-			if not source.alive then
-				continue
-			end
-			local destination = archetype_find_without(source, component)
-
-			local source_entities = source.entities
-			local columns_map = source.columns_map
-			local destination_columns = destination.columns
-			local destination_components = destination.components
-
-			-- array lookup that maps destinations columns to source columns with 1/1 indexes
-			-- should be faster to iterate and index than a hashmap
-			local columns_array_map = table.create(#destination_components) :: Array<Column>
-
-			for index, id in destination_components do
-				local column = columns_map[id]
-				columns_array_map[index] = column
-			end
-
-			local post_removed_callbacks: Array<{ () -> () }>
-
-			for row, entity in source_entities do
-				local entity = source_entities[row]
-				if on_removed then
-					local post_removed = FIRE_REMOVE_HOOKS(on_removed, entity :: any, component)
-					if post_removed then
-						if post_removed_callbacks then
-							table.insert(post_removed_callbacks, post_removed)
-						else
-							post_removed_callbacks = { post_removed }
-						end
-					end
-				end
-
-				local record = get_entity_record(entity :: any) :: EntityRecord
-				local destination_row = archetype_insert_entity(entity :: any, destination)
-				record.archetype = destination
-				record.archetype_row = destination_row
-
-				for index, destination_column in destination_columns do
-					local column = columns_array_map[index]
-					destination_column[destination_row] = column[row]
-				end
-			end
-
-			-- we do this so we keep the original entities table so we can iterate it later for the observers
-			-- the alternative is cloning the entities table, or fire the observers inside the loop
-			-- but that would mean removing the entities and columns entries one by one, instead of using table.clear
-			-- this shouldnt be a problem as nothing holds the entities array (I think?)
-			source.entities = {}
-			source.alive = false
-
-			for _, column in source.columns do
-				if column ~= NULL_ARRAY then
-					table.clear(column)
-				end
-			end
-
-			if monitors then
-				for _, monitor in monitors do
-					local match = monitor.match
-					local matched_before = match(source)
-					local matched_after = match(destination)
-
-					if matched_before ~= matched_after then
-						if matched_before then
-							local removed = monitor.removed
-							if removed then
-								for _, entity in source_entities do
-									removed(entity :: any)
-								end
-							end
-						else
-							local added = monitor.added
-							if added then
-								for _, entity in source_entities do
-									added(entity :: any)
-								end
-							end
-						end
-					end
-				end
-			end
-
-			if observers_added then
-				for _, observer in observers_added do
-					if observer.match(destination) then
-						for _, entity in source_entities do
-							observer.callback(entity :: any)
-						end
-					end
-				end
-			end
-
-			if post_removed_callbacks then
-				for _, post_removed in post_removed_callbacks :: Array<{ () -> () }> do
-					for _, callback in post_removed do
-						callback()
-					end
-				end
-			end
-		end
+		component_record_wipe(component_record, id)
 	end
 
 	local function world_clear(entity: u53)
