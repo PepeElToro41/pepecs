@@ -41,8 +41,8 @@ type QueryIdObserver = {
 
 export type Monitor = {
 	cleanup: Cleanup,
-	added: (entity: Entity) -> (),
-	removed: (entity: Entity) -> (),
+	added: ((entity: Entity) -> ()) -> (),
+	removed: ((entity: Entity) -> ()) -> (),
 }
 
 export type Query<T...> = typeof(setmetatable(
@@ -112,6 +112,20 @@ export type EntityRecord = {
 	archetype_changed: { ArchetypeChangedHook }?,
 }
 
+export type ReacheableCacheNode = {
+	next: ReacheableCacheNode,
+	prev: ReacheableCacheNode,
+}
+
+export type ReacheableCache = {
+	reacheable_map: { [u53]: ComponentRecord },
+	reacheable_list: {
+		first: ReacheableCacheNode,
+		last: ReacheableCacheNode,
+		count: number,
+	},
+}
+
 export type ComponentRecord = {
 	column_index: Map<ArchetypeId, number>,
 	pairs_count: Map<ArchetypeId, number>,
@@ -122,6 +136,8 @@ export type ComponentRecord = {
 	archetype_count: number,
 	flags: Bitset,
 
+	reacheable: ReacheableCache,
+
 	on_added: { SetHook }?,
 	on_changed: { SetHook }?,
 	on_removed: { RemovedHook }?,
@@ -131,7 +147,7 @@ export type ComponentRecord = {
 	-- observers_added will fire when the entity's archetype changes
 	-- observers_changed will fire when the column value changes
 	observers_added: { QueryIdObserver }?,
-	observers_changed: { QueryIdObserver },
+	observers_changed: { QueryIdObserver }?,
 }
 
 export type ComponentsLookup = Map<u53, ComponentRecord>
@@ -169,8 +185,8 @@ export type World = {
 	component: <T>() -> Component<T>,
 	entity: () -> Entity,
 
-	exists: () -> boolean,
-	alive: () -> boolean,
+	exists: (entity: Entity) -> boolean,
+	alive: (entity: Entity) -> boolean,
 	deleting: (entity: Entity) -> boolean,
 
 	has: (entity: Entity, id: Component) -> boolean,
@@ -249,30 +265,38 @@ export type World = {
 }
 
 local preregistered_count = 0
-local preregistered_components: Map<u24, true> = {}
+local preregistered_components: Map<u53, true> = {}
+local preregistered_metadata: Map<u53, Map<u53, any>> = {}
 
-local MAX_COMPONENT_ID = _G.ECS_MAX_COMPONENT_ID or 256
+local MAX_COMPONENT_ID: number = _G.ECS_MAX_COMPONENT_ID or 256
 
 local ENTITY_MASK = bit32.lshift(1, 24)
 local GENERATION_MASK = bit32.lshift(1, 16)
 local PAIR_OFFSET = 2 ^ 48
 
+--[[
 local BITSET_RANGE = 32
 local BITSET_PAGE_SIZE = 8
 local BITSET_MAX_ID = BITSET_RANGE * BITSET_PAGE_SIZE
+]]
 
 local ECS_WILDCARD = MAX_COMPONENT_ID + 1
 local ECS_CHILDOF = MAX_COMPONENT_ID + 2
 local ECS_NAME = MAX_COMPONENT_ID + 3
 local ECS_COMPONENT = MAX_COMPONENT_ID + 4
 local ECS_EXCLUSIVE = MAX_COMPONENT_ID + 5
-local ECS_REST = MAX_COMPONENT_ID + 6
+local ECS_ON_DELETE_TARGET = MAX_COMPONENT_ID + 6
+local ECS_DELETE = MAX_COMPONENT_ID + 7
+local ECS_ON_DELETE = MAX_COMPONENT_ID + 8
+local ECS_ERROR = MAX_COMPONENT_ID + 10
+local ECS_REST = MAX_COMPONENT_ID + 11
 
 local IS_COMPONENT_FLAG = bit32.lshift(1, 0)
 local IS_EXCLUSIVE_FLAG = bit32.lshift(1, 1)
 local HAS_DELETE_FLAG = bit32.lshift(1, 2)
 
 local NULL_ARRAY = table.freeze {} :: { any }
+local NULL_VALUE = newproxy()
 
 local function NOOP() end
 
@@ -336,6 +360,16 @@ local function PREREGISTER_TAG()
 	return id
 end
 
+local function PREREGISTER_METADATA<T>(entity: u53, id: u53, value: T?)
+	local meta: Map<u53, any> = preregistered_metadata[entity]
+	if not meta then
+		meta = {}
+		preregistered_metadata[entity] = meta
+	end
+	meta[id] = if value == nil then NULL_VALUE else value
+end
+
+--[[
 local function SET_COMPONENT_BITSETS(component_bitsets: Map<number, Bitset>, id: number)
 	local bit = id - 1
 	local bitset_page = bit // BITSET_RANGE
@@ -345,6 +379,7 @@ local function SET_COMPONENT_BITSETS(component_bitsets: Map<number, Bitset>, id:
 	local bitset = component_bitsets[bitset_index] or 0
 	component_bitsets[bitset_index] = bit32.bor(bitset, bit32.lshift(1, bit_index))
 end
+]]
 
 local CHECK_FLAG = bit32.btest
 
@@ -384,8 +419,8 @@ local function FIRE_SET_HOOKS(hooks: { SetHook }, entity: u53, id: u53, data: an
 	end
 end
 
-local function FIRE_REMOVE_HOOKS(hooks: { RemovedHook }, entity: u53, id: u53)
-	local post_removed_callbacks: { () -> () }? = nil
+local function FIRE_REMOVE_HOOKS(hooks: { RemovedHook }, entity: u53, id: u53, append_to: { () -> () }?)
+	local post_removed_callbacks: { () -> () }? = append_to
 
 	for _, hook in hooks do
 		local post_removed = hook(entity :: any, id :: any)
@@ -1951,8 +1986,8 @@ end
 query_mt.with = query_with
 query_mt.without = query_without
 query_mt.clone = query_clone
-query_mt.rematch = query_clone
-query_mt.archetypes = query_clone
+query_mt.rematch = query_rematch
+query_mt.archetypes = query_archetypes
 
 query_mt.match = query_match
 query_mt.has = query_has
@@ -1969,6 +2004,30 @@ query_mt.patch = query_patch
 
 query_mt.monitor = query_monitor
 query_mt.observe = query_observe
+
+type QueryBuildEntry = {
+	id: Id,
+}
+
+type QueryBuildParams = {
+	terms: { QueryBuildEntry | Id },
+	variables: { QueryBuildEntry | Id }?,
+	match: { QueryBuildEntry | Id }?,
+}
+
+local function term_id(id: Id) end
+
+local function term_or(...: Id)
+	local ids = { ... }
+end
+
+local function query_build(params: QueryBuildParams)
+	return 1
+end
+
+local build = query_build {
+	terms = {},
+}
 
 local function world_new()
 	local dense_arr = {}
@@ -2154,7 +2213,35 @@ local function world_new()
 	end
 
 	local function component_record_create(id: u53)
-		local is_component = world_has(id, ECS_COMPONENT) or (preregistered_components[id] or false)
+		local is_pair = IS_PAIR(id)
+		local relation = id
+		local is_exclusive = false
+		local has_delete = false
+		local target: u53? = nil
+
+		if is_pair then
+			relation = get_entity_alive(PAIR_FIRST(id)) :: number
+			target = get_entity_alive(PAIR_SECOND(id))
+
+			has_delete = world_has(relation, ECS_PAIR(ECS_ON_DELETE_TARGET, ECS_DELETE))
+			is_exclusive = world_has(relation, ECS_EXCLUSIVE)
+		end
+
+		local is_component = world_has(relation, ECS_COMPONENT) or preregistered_components[id]
+
+		if world_has(relation, ECS_PAIR(ECS_ON_DELETE, ECS_DELETE)) then
+			has_delete = true
+		end
+
+		if target and not is_component then
+			is_component = world_has(target, ECS_COMPONENT)
+		end
+
+		local flags = bit32.bor(
+			(is_component and IS_COMPONENT_FLAG) or 0,
+			(has_delete and HAS_DELETE_FLAG) or 0,
+			(is_exclusive and IS_EXCLUSIVE_FLAG) or 0
+		)
 
 		local record: ComponentRecord = {
 			column_index = {},
@@ -2162,7 +2249,7 @@ local function world_new()
 			pair_records = nil,
 
 			archetype_count = 0,
-			flags = bit32.bor((is_component and IS_COMPONENT_FLAG) or 0),
+			flags = flags,
 
 			monitors = {},
 			observers_added = {},
@@ -2539,12 +2626,7 @@ local function world_new()
 
 		local columns_map = source.columns_map
 		local destination_columns = destination.columns
-
-		for row, entity in entities do
-			local record = get_entity_record(entity) :: EntityRecord
-			record.archetype = destination
-			record.archetype_row = destination_last_row + row
-		end
+		local destination_components = destination.components
 
 		if destination == ROOT_ARCHETYPE then
 			for _, entity in entities do
@@ -2559,8 +2641,9 @@ local function world_new()
 				record.archetype_row = destination_last_row + row
 			end
 
-			table.move(entities :: { Entity }, 1, source_last_row, destination_last_row + 1, destination_entities)
-			for id, destination_column in destination_columns do
+			table.move(entities :: any, 1, source_last_row, destination_last_row + 1, destination_entities)
+			for index, destination_column in destination_columns do
+				local id = destination_components[index]
 				local column = columns_map[id]
 				table.move(column, 1, source_last_row, destination_last_row + 1, destination_column)
 			end
@@ -2652,29 +2735,37 @@ local function world_new()
 			return
 		end
 
-		local destination = archetype_find_with(source, id)
+		local destination: Archetype
+
+		if IS_PAIR(id) then
+			local relation = PAIR_FIRST(id)
+			local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
+			local relation_record = components_lookup[ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)]
+			local wildcard_record = components_lookup[ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)]
+		else
+			local component_record = components_lookup[id]
+			destination = archetype_find_with(source, id)
+
+			local monitors = component_record.monitors
+			if monitors then
+				FIRE_QUERY_MONITORS(monitors, entity, source, destination)
+			end
+
+			local observers = component_record.observers_added
+			if observers then
+				FIRE_QUERY_OBSERVERS(observers, entity, destination)
+			end
+
+			local added_hooks = component_record.on_added
+			if added_hooks then
+				FIRE_SET_HOOKS(added_hooks, entity, id)
+			end
+		end
 
 		if source == ROOT_ARCHETYPE then
 			archetype_assign_entity(entity, record, destination)
 		else
 			archetype_move_entity(entity, record, source, destination)
-		end
-
-		local component_record = components_lookup[id]
-
-		local monitors = component_record.monitors
-		if monitors then
-			FIRE_QUERY_MONITORS(monitors, entity, source, destination)
-		end
-
-		local observers = component_record.observers_added
-		if observers then
-			FIRE_QUERY_OBSERVERS(observers, entity, destination)
-		end
-
-		local added_hooks = component_record.on_added
-		if added_hooks then
-			FIRE_SET_HOOKS(added_hooks, entity, id)
 		end
 	end
 
@@ -2776,19 +2867,12 @@ local function world_new()
 		observers_added: { QueryIdObserver }?
 	)
 		local destination = archetype_find_without(archetype, id)
-		local post_removed_callbacks: Array<{ () -> () }>
+		local post_removed_callbacks: { () -> () }?
 
 		if on_removed then
 			-- we fire hooks before we screw the archetypes this bad
 			for _, entity in entities do
-				local post_removed = FIRE_REMOVE_HOOKS(on_removed, entity, id)
-				if post_removed then
-					if post_removed_callbacks then
-						table.insert(post_removed_callbacks, post_removed)
-					else
-						post_removed_callbacks = { post_removed }
-					end
-				end
+				post_removed_callbacks = FIRE_REMOVE_HOOKS(on_removed, entity, id, post_removed_callbacks)
 			end
 		end
 
@@ -2811,10 +2895,8 @@ local function world_new()
 		end
 
 		if post_removed_callbacks then
-			for _, post_removed in post_removed_callbacks :: Array<{ () -> () }> do
-				for _, callback in post_removed do
-					callback()
-				end
+			for _, callback in post_removed_callbacks do
+				callback()
 			end
 		end
 	end
@@ -2847,7 +2929,7 @@ local function world_new()
 
 	local function clear_entity_components(entity: u53, record: EntityRecord)
 		local archetype = record.archetype
-		local post_removed_callbacks: Array<{ () -> () }>
+		local post_removed_callbacks: { () -> () }?
 		local monitors_set: Map<QueryIdMonitor, true> = {}
 
 		for _, id in archetype.components do
@@ -2856,14 +2938,7 @@ local function world_new()
 
 			local removed_hooks = component_record.on_removed
 			if removed_hooks then
-				local post_removed = FIRE_REMOVE_HOOKS(removed_hooks, entity, id)
-				if post_removed then
-					if post_removed_callbacks then
-						table.insert(post_removed_callbacks, post_removed)
-					else
-						post_removed_callbacks = { post_removed }
-					end
-				end
+				post_removed_callbacks = FIRE_REMOVE_HOOKS(removed_hooks, entity, id, post_removed_callbacks)
 			end
 		end
 
@@ -2881,10 +2956,8 @@ local function world_new()
 		end
 
 		if post_removed_callbacks then
-			for _, post_removed in post_removed_callbacks do
-				for _, callback in post_removed do
-					callback()
-				end
+			for _, callback in post_removed_callbacks do
+				callback()
 			end
 		end
 	end
@@ -3038,7 +3111,9 @@ local function world_new()
 			end
 		end
 
-		clear_entity_components(entity, record)
+		if record.archetype ~= ROOT_ARCHETYPE then
+			clear_entity_components(entity, record)
+		end
 		local modified_archetype = record.archetype
 
 		-- monitors/hooks can move the entity out of the root archetype by adding extra components
@@ -3311,7 +3386,7 @@ local function world_new()
 
 		local destination = archetype_ensure(destination_ids)
 		if source ~= destination then
-			local post_removed_callbacks: Array<{ () -> () }>
+			local post_removed_callbacks: { () -> () }?
 			local monitors_set: Map<QueryIdMonitor, true> = {}
 			local observers_added_set: Map<QueryIdObserver, true> = {}
 
@@ -3321,14 +3396,7 @@ local function world_new()
 
 				local removed_hooks = component_record.on_removed
 				if removed_hooks then
-					local post_removed = FIRE_REMOVE_HOOKS(removed_hooks, entity, id)
-					if post_removed then
-						if post_removed_callbacks then
-							table.insert(post_removed_callbacks, post_removed)
-						else
-							post_removed_callbacks = { post_removed }
-						end
-					end
+					post_removed_callbacks = FIRE_REMOVE_HOOKS(removed_hooks, entity, id, post_removed_callbacks)
 				end
 			end
 
@@ -3341,10 +3409,8 @@ local function world_new()
 			FIRE_QUERY_OBSERVERS_SET(observers_added_set, entity, destination)
 
 			if post_removed_callbacks then
-				for _, post_removed in post_removed_callbacks do
-					for _, callback in post_removed do
-						callback()
-					end
+				for _, callback in post_removed_callbacks do
+					callback()
 				end
 			end
 		end
@@ -3403,10 +3469,14 @@ local function world_new()
 			return NOOP :: () -> u53
 		end
 
-		local archetype = record.archetype
-		local archetype_id = archetype.archetype_id
 		local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
 		local pair_record = components_lookup[relation_wildcard]
+		if not pair_record then
+			return NOOP :: () -> u53
+		end
+
+		local archetype = record.archetype
+		local archetype_id = archetype.archetype_id
 		local pairs_count = pair_record.pairs_count[archetype_id]
 
 		if not pairs_count then
@@ -3418,7 +3488,7 @@ local function world_new()
 		local nth = 0
 
 		return function(): u53
-			if pairs_count >= nth then
+			if nth >= pairs_count then
 				return nil :: any
 			end
 
@@ -3447,7 +3517,7 @@ local function world_new()
 		return function(): u53
 			local entity = entities[row]
 			while not entity do
-				archetype_id = next(archetypes, archetype_id)
+				archetype_id = next(archetypes, archetype_id) :: number
 				if not archetype_id then
 					return nil :: any
 				end
@@ -3476,7 +3546,7 @@ local function world_new()
 			return false
 		end
 		local dense = record.dense
-		if dense <= entity_index.alive then
+		if dense > entity_index.alive then
 			return false
 		end
 		local alive_id = dense_arr[dense]
@@ -3616,8 +3686,6 @@ local function world_new()
 		is_tag = is_tag,
 	} :: any
 
-	-- query
-
 	local function world_query(...: u53)
 		local terms = { ... }
 		local with = { ... }
@@ -3631,14 +3699,58 @@ local function world_new()
 		get_new_entity_id()
 	end
 
+	world_add(ECS_NAME, ECS_COMPONENT)
+	world_add(ECS_REST, ECS_COMPONENT)
+	world_add(ECS_WILDCARD, ECS_COMPONENT)
+
+	world_set(ECS_WILDCARD, ECS_NAME, "ecs.Wildcard")
+	world_set(ECS_CHILDOF, ECS_NAME, "ecs.ChildOf")
+	world_set(ECS_COMPONENT, ECS_NAME, "ecs.Component")
+
+	world_set(ECS_ON_DELETE, ECS_NAME, "ecs.OnDelete")
+	world_set(ECS_ON_DELETE_TARGET, ECS_NAME, "ecs.OnDeleteTarget")
+
+	world_set(ECS_DELETE, ECS_NAME, "ecs.Delete")
+	world_set(ECS_NAME, ECS_NAME, "ecs.Name")
+	world_set(ECS_REST, ECS_NAME, "ecs.Rest")
+
+	world_add(ECS_ON_DELETE, ECS_EXCLUSIVE)
+	world_add(ECS_ON_DELETE_TARGET, ECS_EXCLUSIVE)
+	world_add(ECS_CHILDOF, ECS_EXCLUSIVE)
+
+	for entity, metadata in preregistered_metadata do
+		for component, value in metadata do
+			if value == NULL_VALUE then
+				world_add(entity, component)
+			else
+				world_set(entity, component, value)
+			end
+		end
+	end
+
 	return world
 end
 
+local function ANY(value: any): any
+	return value
+end
+
 return {
-	is_pair = IS_PAIR,
-	pair = ECS_PAIR :: <R, T>(first: Id<R>, second: Id<T>) -> Pair<R, T>,
-	component = PREREGISTER_COMPONENT,
-	tag = PREREGISTER_TAG,
+	is_pair = ANY(IS_PAIR) :: (Id) -> boolean,
+	pair = ANY(ECS_PAIR) :: <R, T>(first: Id<R>, second: Id<T>) -> Pair<R, T>,
+
+	component = ANY(PREREGISTER_COMPONENT) :: () -> Component,
+	tag = ANY(PREREGISTER_TAG) :: () -> Entity,
+	meta = ANY(PREREGISTER_METADATA) :: <T>(Entity, Component<T>, T?) -> (),
+
+	Name = ANY(ECS_NAME) :: Component<string>,
+	Exclusive = ANY(ECS_EXCLUSIVE) :: Entity,
+	OnDelete = ANY(ECS_ON_DELETE) :: Entity,
+	OnDeleteTarget = ANY(ECS_ON_DELETE_TARGET) :: Entity,
+	Wildcard = ANY(ECS_WILDCARD) :: Entity,
+	Error = ANY(ECS_ERROR) :: Entity,
+	Delete = ANY(ECS_DELETE) :: Entity,
+
 	world = world_new,
 	World = {
 		new = world_new,
