@@ -3836,8 +3836,6 @@ return {
 	Wildcard = ANY(ECS_WILDCARD) :: Entity,
 	Error = ANY(ECS_ERROR) :: Entity,
 	Delete = ANY(ECS_DELETE) :: Entity,
-	Traversable = ANY(ECS_TRAVERSABLE),
-	Disabled = ANY(),
 
 	world = world_new,
 	World = {
