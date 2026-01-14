@@ -100,7 +100,7 @@ export type Archetype = {
 
 	columns_map: { [u53]: Column },
 	forward_edges: Map<u53, Archetype>,
-	backward_edges: Map<u53, Archetype>,
+	backwards_edges: Map<u53, Archetype>,
 }
 
 export type EntityRecord = {
@@ -112,37 +112,23 @@ export type EntityRecord = {
 	archetype_changed: { ArchetypeChangedHook }?,
 }
 
-export type ReacheableCacheNode = {
-	next: ReacheableCacheNode,
-	prev: ReacheableCacheNode,
-}
-
-export type ReacheableCache = {
-	reacheable_map: { [u53]: ComponentRecord },
-	reacheable_list: {
-		first: ReacheableCacheNode,
-		last: ReacheableCacheNode,
-		count: number,
-	},
+export type PairRecord = ComponentRecord & {
+	pairs_count: Map<ArchetypeId, number>,
+	pair_records: Map<u53, ComponentRecord>,
 }
 
 export type ComponentRecord = {
 	column_index: Map<ArchetypeId, number>,
-	pairs_count: Map<ArchetypeId, number>,
-
-	-- only defined for pair(rel, *)
-	pair_records: Map<u53, ComponentRecord>?,
 
 	archetype_count: number,
 	flags: Bitset,
-
-	reacheable: ReacheableCache,
 
 	on_added: { SetHook }?,
 	on_changed: { SetHook }?,
 	on_removed: { RemovedHook }?,
 
 	monitors: { QueryIdMonitor }?,
+	inherited: ComponentRecord?,
 
 	-- observers_added will fire when the entity's archetype changes
 	-- observers_changed will fire when the column value changes
@@ -289,7 +275,9 @@ local ECS_ON_DELETE_TARGET = MAX_COMPONENT_ID + 6
 local ECS_DELETE = MAX_COMPONENT_ID + 7
 local ECS_ON_DELETE = MAX_COMPONENT_ID + 8
 local ECS_ERROR = MAX_COMPONENT_ID + 10
-local ECS_REST = MAX_COMPONENT_ID + 11
+local ECS_TRAVERSABLE = MAX_COMPONENT_ID + 11
+local ECS_DISABLED = MAX_COMPONENT_ID + 12
+local ECS_REST = MAX_COMPONENT_ID + 13
 
 local IS_COMPONENT_FLAG = bit32.lshift(1, 0)
 local IS_EXCLUSIVE_FLAG = bit32.lshift(1, 1)
@@ -542,6 +530,11 @@ local function ACCUMULATE_MONITORS_SET(
 				observers_changed_set[observer] = true
 			end
 		end
+	end
+
+	local inherited = component_record.inherited
+	if inherited then
+		ACCUMULATE_MONITORS_SET(inherited, monitors_set, observers_added_set, observers_changed_set)
 	end
 end
 
@@ -2060,7 +2053,7 @@ local function world_new()
 
 		columns_map = {},
 		forward_edges = {},
-		backward_edges = {},
+		backwards_edges = {},
 	}
 	archetypes[1] = ROOT_ARCHETYPE
 	archetypes_lookup[""] = ROOT_ARCHETYPE
@@ -2219,12 +2212,28 @@ local function world_new()
 		local has_delete = false
 		local target: u53? = nil
 
+		local record: ComponentRecord = {
+			column_index = {},
+			pairs_count = {},
+
+			archetype_count = 0,
+			flags = nil :: any,
+
+			monitors = {},
+			observers_added = {},
+			observers_changed = {},
+		}
+
 		if is_pair then
 			relation = get_entity_alive(PAIR_FIRST(id)) :: number
 			target = get_entity_alive(PAIR_SECOND(id))
 
 			has_delete = world_has(relation, ECS_PAIR(ECS_ON_DELETE_TARGET, ECS_DELETE))
 			is_exclusive = world_has(relation, ECS_EXCLUSIVE)
+
+			local pair_record = record :: PairRecord
+			pair_record.pairs_count = {}
+			pair_record.pair_records = {}
 		end
 
 		local is_component = world_has(relation, ECS_COMPONENT) or preregistered_components[id]
@@ -2237,24 +2246,11 @@ local function world_new()
 			is_component = world_has(target, ECS_COMPONENT)
 		end
 
-		local flags = bit32.bor(
+		record.flags = bit32.bor(
 			(is_component and IS_COMPONENT_FLAG) or 0,
 			(has_delete and HAS_DELETE_FLAG) or 0,
 			(is_exclusive and IS_EXCLUSIVE_FLAG) or 0
 		)
-
-		local record: ComponentRecord = {
-			column_index = {},
-			pairs_count = {},
-			pair_records = nil,
-
-			archetype_count = 0,
-			flags = flags,
-
-			monitors = {},
-			observers_added = {},
-			observers_changed = {},
-		}
 
 		components_lookup[id] = record
 		return record
@@ -2293,11 +2289,7 @@ local function world_new()
 		end
 	end
 
-	local function archetype_append_to_record(
-		record: ComponentRecord,
-		archetype_id: ArchetypeId,
-		index: number
-	): boolean
+	local function archetype_append_to_pair(record: PairRecord, archetype_id: ArchetypeId, index: number): boolean
 		local column_index = record.column_index
 		local pairs_count = record.pairs_count
 
@@ -2446,15 +2438,15 @@ local function world_new()
 		local archetype_id = archetype.archetype_id
 
 		local forward_edges = archetype.forward_edges
-		local backward_edges = archetype.backward_edges
+		local backwards_edges = archetype.backwards_edges
 
 		for id, edge_archetype in forward_edges do
-			edge_archetype.backward_edges[id] = nil
+			edge_archetype.backwards_edges[id] = nil
 			forward_edges[id] = nil
 		end
-		for id, edge_archetype in backward_edges do
+		for id, edge_archetype in backwards_edges do
 			edge_archetype.forward_edges[id] = nil
-			backward_edges[id] = nil
+			backwards_edges[id] = nil
 		end
 
 		archetypes[archetype_id] = nil
@@ -2463,7 +2455,9 @@ local function world_new()
 		for id in archetype.columns_map do
 			local component_record = components_lookup[id]
 			component_record.column_index[archetype_id] = nil
-			component_record.pairs_count[archetype_id] = nil
+			if (component_record :: PairRecord).pairs_count then
+				(component_record :: PairRecord).pairs_count[archetype_id] = nil
+			end
 			component_record.archetype_count -= 1
 
 			if component_record.archetype_count == 0 then
@@ -2494,7 +2488,7 @@ local function world_new()
 
 			columns_map = columns_map,
 			forward_edges = {},
-			backward_edges = {},
+			backwards_edges = {},
 		}
 
 		for index, id in ids do
@@ -2506,17 +2500,17 @@ local function world_new()
 			columns[index] = column
 			columns_map[id] = column
 
-			archetype_append_to_record(id_record, archetype_id, index)
+			id_record.column_index[archetype_id] = index
 
 			if IS_PAIR(id) then
 				local relation = PAIR_FIRST(id)
 				local target = PAIR_SECOND(id)
 
 				local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
-				local relation_record = component_record_ensure(relation_wildcard)
+				local relation_record = component_record_ensure(relation_wildcard) :: PairRecord
 				relation_record.archetype_count += 1
 
-				local relation_appended = archetype_append_to_record(relation_record, archetype_id, index)
+				local relation_appended = archetype_append_to_pair(relation_record, archetype_id, index)
 				if relation_appended then
 					columns_map[relation_wildcard] = column
 				end
@@ -2531,10 +2525,10 @@ local function world_new()
 				end
 
 				local target_wildcard = ECS_PAIR(ECS_WILDCARD, target)
-				local target_record = component_record_ensure(target_wildcard)
+				local target_record = component_record_ensure(target_wildcard) :: PairRecord
 				target_record.archetype_count += 1
 
-				local target_appended = archetype_append_to_record(target_record, archetype_id, index)
+				local target_appended = archetype_append_to_pair(target_record, archetype_id, index)
 				if target_appended then
 					columns_map[target_wildcard] = column
 				end
@@ -2566,20 +2560,40 @@ local function world_new()
 	end
 
 	local function archetype_find_with(source: Archetype, id: u53): Archetype
-		if source.columns_map[id] then
-			return source
-		end
+		local forward_edges = source.forward_edges
+		local destination = forward_edges[id]
 
-		local edges = source.forward_edges
-		local destination = edges[id]
 		if not destination then
 			local destination_components = table.clone(source.components)
 			local insert_at = FIND_INSERT(destination_components, id)
 			table.insert(destination_components, insert_at, id)
 
 			local found = archetype_ensure(destination_components)
-			edges[id] = found
-			found.backward_edges[id] = source
+			forward_edges[id] = found
+			found.backwards_edges[id] = source
+			return found
+		end
+
+		return destination
+	end
+
+	local function archetype_find_swap_with(source: Archetype, swapped: u53, id: u53, at: number)
+		local forward_edges = source.forward_edges
+		local destination = forward_edges[id]
+
+		if not destination then
+			local destination_components = table.clone(source.components)
+			destination_components[at] = id
+
+			local found = archetype_ensure(destination_components)
+			forward_edges[id] = found
+
+			local backwards_edges = source.backwards_edges
+			local root = backwards_edges[swapped]
+			if root then
+				root.forward_edges[id] = found
+			end
+
 			return found
 		end
 
@@ -2587,7 +2601,7 @@ local function world_new()
 	end
 
 	local function archetype_find_without(source: Archetype, id: u53)
-		local edges = source.backward_edges
+		local edges = source.backwards_edges
 		local destination = edges[id]
 		if not destination then
 			local destination_components = table.clone(source.components)
@@ -2683,19 +2697,51 @@ local function world_new()
 		if column then
 			column[record.archetype_row] = data
 
-			local component_record = components_lookup[id]
+			local component_record: ComponentRecord? = components_lookup[id]
+			while component_record do
+				local observers = component_record.observers_changed
+				if observers then
+					FIRE_QUERY_OBSERVERS(observers, entity, source)
+				end
 
-			local observers = component_record.observers_changed
-			if observers then
-				FIRE_QUERY_OBSERVERS(observers, entity, source)
-			end
+				local changed_hooks = component_record.on_changed
+				if changed_hooks then
+					FIRE_SET_HOOKS(changed_hooks, entity, id, data)
+				end
 
-			local changed_hooks = component_record.on_changed
-			if changed_hooks then
-				FIRE_SET_HOOKS(changed_hooks, entity, id, data)
+				component_record = component_record.inherited
 			end
 		else
-			local destination = archetype_find_with(source, id)
+			local swapped_record: PairRecord
+			local post_removed: { () -> () }? = nil
+			local destination: Archetype
+
+			if IS_PAIR(id) then
+				local relation = PAIR_FIRST(id)
+				local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
+				local relation_record = components_lookup[relation_wildcard] :: PairRecord
+
+				if relation_record and CHECK_FLAG(relation_record.flags, IS_EXCLUSIVE_FLAG) then
+					local column_index = relation_record.column_index[source.archetype_id]
+
+					if column_index then
+						local swapped_id = source.components[column_index]
+						destination = archetype_find_swap_with(source, swapped_id, id, column_index)
+						swapped_record = components_lookup[swapped_id] :: PairRecord
+
+						local removed_hooks = swapped_record and swapped_record.on_removed
+						if removed_hooks then
+							post_removed = FIRE_REMOVE_HOOKS(removed_hooks, entity, swapped_id)
+						end
+					else
+						destination = archetype_find_with(source, id)
+					end
+				else
+					destination = archetype_find_with(source, id)
+				end
+			else
+				destination = archetype_find_with(source, id)
+			end
 
 			if source == ROOT_ARCHETYPE then
 				archetype_assign_entity(entity, record, destination)
@@ -2705,27 +2751,48 @@ local function world_new()
 
 			local new_column = destination.columns_map[id]
 			new_column[record.archetype_row] = data
-			local component_record = components_lookup[id]
 
-			local monitors = component_record.monitors
-			if monitors then
-				FIRE_QUERY_MONITORS(monitors, entity, source, destination)
+			if swapped_record then
+				local swap_monitor = swapped_record.monitors
+				if swap_monitor then
+					FIRE_QUERY_MONITORS(swap_monitor, entity, source, destination)
+				end
+
+				local rel_observers = swapped_record.observers_added
+				if rel_observers then
+					FIRE_QUERY_OBSERVERS(rel_observers, entity, destination)
+				end
 			end
 
-			local observers = component_record.observers_added
-			if observers then
-				FIRE_QUERY_OBSERVERS(observers, entity, destination)
+			local component_record: ComponentRecord? = components_lookup[id]
+			while component_record do
+				local monitors = component_record.monitors
+				if monitors then
+					FIRE_QUERY_MONITORS(monitors, entity, source, destination)
+				end
+
+				local observers = component_record.observers_added
+				if observers then
+					FIRE_QUERY_OBSERVERS(observers, entity, destination)
+				end
+
+				local added_hooks = component_record.on_added
+				if added_hooks then
+					FIRE_SET_HOOKS(added_hooks, entity, id, data)
+				end
+				component_record = component_record.inherited
 			end
 
-			local added_hooks = component_record.on_added
-			if added_hooks then
-				FIRE_SET_HOOKS(added_hooks, entity, id, data)
+			if post_removed then
+				for _, callback in post_removed do
+					callback()
+				end
 			end
 		end
 	end
 
 	local function world_add(entity: u53, id: u53)
-		local record = get_entity_record_alive(entity)
+		local record = get_entity_record_asserts_alive(entity)
 		if not record then
 			return
 		end
@@ -2735,17 +2802,58 @@ local function world_new()
 			return
 		end
 
+		local swapped_record: PairRecord
+		local post_removed: { () -> () }? = nil
 		local destination: Archetype
 
 		if IS_PAIR(id) then
 			local relation = PAIR_FIRST(id)
 			local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
-			local relation_record = components_lookup[ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)]
-			local wildcard_record = components_lookup[ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)]
-		else
-			local component_record = components_lookup[id]
-			destination = archetype_find_with(source, id)
+			local relation_record = components_lookup[relation_wildcard] :: PairRecord
 
+			if relation_record and CHECK_FLAG(relation_record.flags, IS_EXCLUSIVE_FLAG) then
+				local column_index = relation_record.column_index[source.archetype_id]
+
+				if column_index then
+					local swapped_id = source.components[column_index]
+					destination = archetype_find_swap_with(source, swapped_id, id, column_index)
+					swapped_record = components_lookup[swapped_id] :: PairRecord
+
+					local removed_hooks = swapped_record and swapped_record.on_removed
+					if removed_hooks then
+						post_removed = FIRE_REMOVE_HOOKS(removed_hooks, entity, swapped_id)
+					end
+				else
+					destination = archetype_find_with(source, id)
+				end
+			else
+				destination = archetype_find_with(source, id)
+			end
+		else
+			destination = archetype_find_with(source, id)
+		end
+
+		if source == ROOT_ARCHETYPE then
+			archetype_assign_entity(entity, record, destination)
+		else
+			archetype_move_entity(entity, record, source, destination)
+		end
+
+		if swapped_record then
+			local swap_monitor = swapped_record.monitors
+			if swap_monitor then
+				FIRE_QUERY_MONITORS(swap_monitor, entity, source, destination)
+			end
+
+			local rel_observers = swapped_record.observers_added
+			if rel_observers then
+				FIRE_QUERY_OBSERVERS(rel_observers, entity, destination)
+			end
+		end
+
+		local component_record: ComponentRecord? = components_lookup[id]
+
+		while component_record do
 			local monitors = component_record.monitors
 			if monitors then
 				FIRE_QUERY_MONITORS(monitors, entity, source, destination)
@@ -2760,12 +2868,14 @@ local function world_new()
 			if added_hooks then
 				FIRE_SET_HOOKS(added_hooks, entity, id)
 			end
+
+			component_record = component_record.inherited
 		end
 
-		if source == ROOT_ARCHETYPE then
-			archetype_assign_entity(entity, record, destination)
-		else
-			archetype_move_entity(entity, record, source, destination)
+		if post_removed then
+			for _, callback in post_removed do
+				callback()
+			end
 		end
 	end
 
@@ -2972,8 +3082,8 @@ local function world_new()
 		end
 
 		local component_record = components_lookup[entity]
-		local relation_record = components_lookup[ECS_PAIR(entity, ECS_WILDCARD)]
-		local target_record = components_lookup[ECS_PAIR(ECS_WILDCARD, entity)]
+		local relation_record = components_lookup[ECS_PAIR(entity, ECS_WILDCARD)] :: PairRecord
+		local target_record = components_lookup[ECS_PAIR(ECS_WILDCARD, entity)] :: PairRecord
 
 		if component_record then
 			local has_delete = CHECK_FLAG(component_record.flags, HAS_DELETE_FLAG)
@@ -2984,8 +3094,8 @@ local function world_new()
 					local last_row = #entities
 
 					for row = last_row, 1, -1 do
-						local entity = entities[last_row]
-						world_delete(entity :: any)
+						local child = entities[last_row]
+						world_delete(child :: any)
 					end
 
 					archetype_destroy(archetype)
@@ -3025,8 +3135,8 @@ local function world_new()
 
 				if deleted_any then
 					for row = #entities, 1, -1 do
-						local entity = entities[row]
-						world_delete(entity)
+						local child = entities[row]
+						world_delete(child)
 					end
 				else
 					if removing_count == 1 then
@@ -3097,8 +3207,8 @@ local function world_new()
 							end
 							archetype_swap_to(archetype, entities, affected, ROOT_ARCHETYPE)
 						else
-							for index = pair_start, id_count do
-								local id = components[index]
+							for i = pair_start, id_count do
+								local id = components[i]
 								local id_record = components_lookup[id]
 								affected[id] = id_record
 							end
@@ -3447,7 +3557,7 @@ local function world_new()
 		local archetype = record.archetype
 		local archetype_id = archetype.archetype_id
 		local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
-		local pair_record = components_lookup[relation_wildcard]
+		local pair_record = components_lookup[relation_wildcard] :: PairRecord
 		local pairs_count = pair_record.pairs_count[archetype_id]
 
 		if not pairs_count then
@@ -3470,7 +3580,7 @@ local function world_new()
 		end
 
 		local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
-		local pair_record = components_lookup[relation_wildcard]
+		local pair_record = components_lookup[relation_wildcard] :: PairRecord
 		if not pair_record then
 			return NOOP :: () -> u53
 		end
@@ -3750,6 +3860,8 @@ return {
 	Wildcard = ANY(ECS_WILDCARD) :: Entity,
 	Error = ANY(ECS_ERROR) :: Entity,
 	Delete = ANY(ECS_DELETE) :: Entity,
+	Traversable = ANY(ECS_TRAVERSABLE),
+	Disabled = ANY(),
 
 	world = world_new,
 	World = {
