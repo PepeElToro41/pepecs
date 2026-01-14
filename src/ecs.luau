@@ -1998,30 +1998,6 @@ query_mt.patch = query_patch
 query_mt.monitor = query_monitor
 query_mt.observe = query_observe
 
-type QueryBuildEntry = {
-	id: Id,
-}
-
-type QueryBuildParams = {
-	terms: { QueryBuildEntry | Id },
-	variables: { QueryBuildEntry | Id }?,
-	match: { QueryBuildEntry | Id }?,
-}
-
-local function term_id(id: Id) end
-
-local function term_or(...: Id)
-	local ids = { ... }
-end
-
-local function query_build(params: QueryBuildParams)
-	return 1
-end
-
-local build = query_build {
-	terms = {},
-}
-
 local function world_new()
 	local dense_arr = {}
 	local sparse_arr = {}
