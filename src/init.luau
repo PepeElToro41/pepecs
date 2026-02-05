@@ -230,7 +230,18 @@ export type World = {
 			Component<G>,
 			Component<H>
 		) -> (A, B, C, D, E, F, G, H))
-		& (Entity, ...Component) -> ...any,
+		& (<A, B, C, D, E, F, G, H>(
+			Entity,
+			Component<A>,
+			Component<B>,
+			Component<C>,
+			Component<D>,
+			Component<E>,
+			Component<F>,
+			Component<G>,
+			Component<H>,
+			...Component
+		) -> (A, B, C, D, E, F, G, H, ...any)),
 
 	parent: (child: Entity) -> Entity,
 	children: (parent: Entity) -> () -> Entity,
