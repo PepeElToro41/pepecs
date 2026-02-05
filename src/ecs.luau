@@ -19,7 +19,7 @@ export type Pair<R, T> = Id<R>
 
 type ArchetypeChangedHook = (source: Archetype, destination: Archetype) -> ()
 type SetHook<T = any> = (entity: Entity, id: Id<T>, value: T) -> ()
-type RemovedHook<T = any> = (entity: Entity, id: Id<T>) -> (() -> ())?
+type RemovedHook<T = any> = ((entity: Entity, id: Id<T>) -> () -> ()?) | (entity: Entity, id: Id<T>) -> ()?
 
 export type ArchetypeMatch = (archetype: Archetype) -> boolean
 
@@ -45,6 +45,16 @@ export type Monitor = {
 	removed: ((entity: Entity) -> ()) -> (),
 }
 
+export type QueryChanged<T...> = typeof(setmetatable(
+	{} :: {
+		iter: () -> () -> (Entity, T...),
+		cleanup: Cleanup,
+	},
+	{} :: {
+		__iter: () -> () -> (Entity, T...),
+	}
+))
+
 export type Query<T...> = typeof(setmetatable(
 	{} :: {
 		is_cached: boolean,
@@ -54,6 +64,7 @@ export type Query<T...> = typeof(setmetatable(
 		clone: (Query<T...>) -> Query<T...>,
 		rematch: (Query<T...>) -> { Archetype },
 		archetypes: (Query<T...>) -> { Archetype },
+		columns: (Query<T...>) -> () -> ...{ any },
 
 		match: (Query<T...>, Archetype) -> boolean,
 		has: (Query<T...>, entity: Entity) -> boolean,
@@ -64,12 +75,13 @@ export type Query<T...> = typeof(setmetatable(
 		first: (Query<T...>, predicator: ((Entity, T...) -> boolean)?) -> (Entity, T...),
 
 		cached: (Query<T...>) -> Query<T...>,
-		cleanup: Cleanup,
+		cleanup: (Query<T...>) -> (),
 		iter: (Query<T...>) -> () -> (Entity, T...),
 		patch: (Query<T...>, mapper: (entity: Entity, T...) -> T...) -> (),
 
 		monitor: (Query<T...>) -> Monitor,
 		observe: (Query<T...>, callback: (entity: Entity) -> ()) -> Cleanup,
+		changed: (Query<T...>) -> QueryChanged<T...>,
 	},
 	{} :: {
 		__iter: () -> () -> (Entity, T...),
@@ -177,9 +189,48 @@ export type World = {
 
 	has: (entity: Entity, id: Component) -> boolean,
 	get: & (<A>(Entity, Component<A>) -> A)
-		& (<A, B>(Entity, Component<A>, Component<A>) -> (A, B))
-		& (<A, B, C>(World, Entity, Component<A>, Component<A>, Component<A>) -> (A, B, C))
-		& (<A, B, C, D>(Entity, Component<A>, Component<B>, Component<C>, Component<D>) -> (A, B, C, D)),
+		& (<A, B>(Entity, Component<A>, Component<B>) -> (A, B))
+		& (<A, B, C>(World, Entity, Component<A>, Component<B>, Component<C>) -> (A, B, C))
+		& (<A, B, C, D>(Entity, Component<A>, Component<B>, Component<C>, Component<D>) -> (A, B, C, D))
+		& (<A, B, C, D, E>(
+			Entity,
+			Component<A>,
+			Component<B>,
+			Component<C>,
+			Component<D>,
+			Component<E>
+		) -> (A, B, C, D, E))
+		& (<A, B, C, D, E, F>(
+			Entity,
+			Component<A>,
+			Component<B>,
+			Component<C>,
+			Component<D>,
+			Component<E>,
+			Component<F>
+		) -> (A, B, C, D, E, F))
+		& (<A, B, C, D, E, F, G>(
+			Entity,
+			Component<A>,
+			Component<B>,
+			Component<C>,
+			Component<D>,
+			Component<E>,
+			Component<F>,
+			Component<G>
+		) -> (A, B, C, D, E, F, G))
+		& (<A, B, C, D, E, F, G, H>(
+			Entity,
+			Component<A>,
+			Component<B>,
+			Component<C>,
+			Component<D>,
+			Component<E>,
+			Component<F>,
+			Component<G>,
+			Component<H>
+		) -> (A, B, C, D, E, F, G, H))
+		& (Entity, ...Component) -> ...any,
 
 	parent: (child: Entity) -> Entity,
 	children: (parent: Entity) -> () -> Entity,
@@ -410,8 +461,8 @@ end
 local function FIRE_REMOVE_HOOKS(hooks: { RemovedHook }, entity: u53, id: u53, append_to: { () -> () }?)
 	local post_removed_callbacks: { () -> () }? = append_to
 
-	for _, hook in hooks do
-		local post_removed = hook(entity :: any, id :: any)
+	for _, hook: any in hooks do
+		local post_removed = hook(entity :: any, id :: any) :: () -> ()
 		if post_removed then
 			if post_removed_callbacks then
 				table.insert(post_removed_callbacks, post_removed)
@@ -729,10 +780,10 @@ end
 
 local function observer_new(
 	world: World,
-	callback: QueryMonitorCallback,
 	terms: { u53 },
 	with_ids: { u53 },
-	without_ids: { u53 }?
+	without_ids: { u53 }?,
+	callback: QueryMonitorCallback
 )
 	local component_record_ensure = world.internal.component_record_ensure
 	local _, archetypes_map, observers_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids)
@@ -839,6 +890,66 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 	end
 
 	return monitor
+end
+
+local function query_changed_new(world: World, terms: { u53 }, with_ids: { u53 }, without_ids: { u53 }?)
+	local iter_queue: { u53 } = {}
+	local iter_indexes: { [u53]: number } = {}
+
+	local observer_cleanup = observer_new(world, terms, with_ids, without_ids, function(entity)
+		local index = iter_indexes[entity]
+		if index then
+			return
+		end
+
+		table.insert(iter_queue, entity)
+		iter_indexes[entity] = #iter_queue
+	end)
+
+	local monitor = monitor_new(world, with_ids, without_ids)
+	monitor.removed(function(entity: any)
+		local index = iter_indexes[entity]
+		if index == nil then
+			return
+		end
+
+		local last_entity = table.remove(iter_queue)
+		if last_entity and last_entity ~= entity then
+			iter_queue[index] = last_entity
+			iter_indexes[last_entity] = index
+		end
+		iter_indexes[entity] = nil
+	end)
+
+	local function iter()
+		local now_queue = iter_queue
+		local row = #now_queue
+		if row == 0 then
+			return NOOP
+		end
+
+		iter_queue = {}
+		iter_indexes = {}
+
+		return function(): (u53, ...any)
+			if row == 0 then
+				return nil :: any
+			end
+			local entity = now_queue[row]
+			row -= 1
+			return entity, world.get(entity :: any, unpack(terms :: { any }))
+		end
+	end
+
+	local function cleanup()
+		observer_cleanup()
+		monitor.cleanup()
+	end
+
+	return setmetatable({
+		iter = iter,
+		cleanup = cleanup,
+	}, { __iter = iter })
 end
 
 local query_mt = {}
@@ -1660,6 +1771,167 @@ local function query_first(query: QueryInternal, predicator: ((Entity, ...any) -
 	return nil :: any
 end
 
+local function query_columns(query: QueryInternal): () -> any
+	local compatible_archetypes = query_archetypes(query)
+	local iter_archetype_index = 1
+	local total_archetypes = #compatible_archetypes
+
+	if total_archetypes == 0 then
+		return NOOP
+	end
+
+	local terms = query.terms
+	local A, B, C, D, E, F, G, H, I = unpack(terms)
+
+	if not A then
+		return function(): Archetype
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			iter_archetype_index -= 1
+
+			return archetype
+		end
+	elseif not B then
+		return function(): ...any
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			iter_archetype_index -= 1
+
+			return archetype, archetype.columns_map[A]
+		end
+	elseif not C then
+		return function(): ...any
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			local columns_map = archetype.columns_map
+
+			iter_archetype_index -= 1
+			return archetype, columns_map[A], columns_map[B]
+		end
+	elseif not D then
+		return function(): ...any
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			local columns_map = archetype.columns_map
+
+			iter_archetype_index -= 1
+			return archetype, columns_map[A], columns_map[B], columns_map[C]
+		end
+	elseif not E then
+		return function(): ...any
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			local columns_map = archetype.columns_map
+
+			iter_archetype_index -= 1
+			return archetype, columns_map[A], columns_map[B], columns_map[C], columns_map[D]
+		end
+	elseif not F then
+		return function(): ...any
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			local columns_map = archetype.columns_map
+
+			iter_archetype_index -= 1
+			return archetype, columns_map[A], columns_map[B], columns_map[C], columns_map[D], columns_map[E]
+		end
+	elseif not G then
+		return function(): ...any
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			local columns_map = archetype.columns_map
+
+			iter_archetype_index -= 1
+			return archetype,
+				columns_map[A],
+				columns_map[B],
+				columns_map[C],
+				columns_map[D],
+				columns_map[E],
+				columns_map[F]
+		end
+	elseif not H then
+		return function(): ...any
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			local columns_map = archetype.columns_map
+
+			iter_archetype_index -= 1
+			return archetype,
+				columns_map[A],
+				columns_map[B],
+				columns_map[C],
+				columns_map[D],
+				columns_map[E],
+				columns_map[F],
+				columns_map[G]
+		end
+	elseif not I then
+		return function(): ...any
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			local columns_map = archetype.columns_map
+
+			iter_archetype_index -= 1
+			return archetype,
+				columns_map[A],
+				columns_map[B],
+				columns_map[C],
+				columns_map[D],
+				columns_map[E],
+				columns_map[F],
+				columns_map[G],
+				columns_map[H]
+		end
+	else
+		local rest = {}
+		local terms_count = #terms
+
+		return function(): ...any
+			if iter_archetype_index > total_archetypes then
+				return nil :: any
+			end
+			local archetype = compatible_archetypes[iter_archetype_index]
+			local columns_map = archetype.columns_map
+
+			iter_archetype_index -= 1
+
+			for i = 9, terms_count do
+				rest[i - 8] = columns_map[terms[i]]
+			end
+
+			return archetype,
+				columns_map[A],
+				columns_map[B],
+				columns_map[C],
+				columns_map[D],
+				columns_map[E],
+				columns_map[F],
+				columns_map[G],
+				columns_map[H],
+				unpack(rest)
+		end
+	end
+end
+
 local function query_patch(query: QueryInternal, mapper: (Entity: Entity, ...any) -> ...any)
 	query_archetypes(query)
 
@@ -1973,7 +2245,11 @@ local function query_monitor(query: QueryInternal)
 end
 
 local function query_observe(query: QueryInternal, callback: QueryMonitorCallback)
-	return observer_new(query.world, callback, query.terms, query.with_ids, query.without_ids)
+	return observer_new(query.world, query.terms, query.with_ids, query.without_ids, callback)
+end
+
+local function query_changed(query: QueryInternal)
+	return query_changed_new(query.world, query.terms, query.with_ids, query.without_ids)
 end
 
 query_mt.with = query_with
@@ -1994,9 +2270,11 @@ query_mt.cleanup = query_cleanup
 query_mt.iter = query_iter
 query_mt.__iter = query_iter
 query_mt.patch = query_patch
+query_mt.columns = query_columns
 
 query_mt.monitor = query_monitor
 query_mt.observe = query_observe
+query_mt.changed = query_changed
 
 local function world_new()
 	local dense_arr = {}
@@ -2142,7 +2420,19 @@ local function world_new()
 		return archetype.columns_map[id] ~= nil
 	end
 
-	local function world_get(entity: u53, a: u53, b: u53, c: u53, d: u53, e: u53, ...): any
+	local function world_get(
+		entity: u53,
+		a: u53,
+		b: u53,
+		c: u53,
+		d: u53,
+		e: u53,
+		f: u53,
+		g: u53,
+		h: u53,
+		i: u53,
+		...
+	): any
 		local record = get_entity_record_asserts_alive(entity)
 		if not record then
 			return nil
@@ -2166,6 +2456,36 @@ local function world_new()
 				fetch(columns_map, b, row),
 				fetch(columns_map, c, row),
 				fetch(columns_map, d, row)
+		elseif not f then
+			return fetch(columns_map, a, row),
+				fetch(columns_map, b, row),
+				fetch(columns_map, c, row),
+				fetch(columns_map, d, row),
+				fetch(columns_map, e, row)
+		elseif not g then
+			return fetch(columns_map, a, row),
+				fetch(columns_map, b, row),
+				fetch(columns_map, c, row),
+				fetch(columns_map, d, row),
+				fetch(columns_map, e, row),
+				fetch(columns_map, f, row)
+		elseif not h then
+			return fetch(columns_map, a, row),
+				fetch(columns_map, b, row),
+				fetch(columns_map, c, row),
+				fetch(columns_map, d, row),
+				fetch(columns_map, e, row),
+				fetch(columns_map, f, row),
+				fetch(columns_map, g, row)
+		elseif not i then
+			return fetch(columns_map, a, row),
+				fetch(columns_map, b, row),
+				fetch(columns_map, c, row),
+				fetch(columns_map, d, row),
+				fetch(columns_map, e, row),
+				fetch(columns_map, f, row),
+				fetch(columns_map, g, row),
+				fetch(columns_map, h, row)
 		else
 			local rest = { ... }
 			for index, id in rest do
@@ -3800,6 +4120,9 @@ local function world_new()
 	world_set(ECS_NAME, ECS_NAME, "ecs.Name")
 	world_set(ECS_REST, ECS_NAME, "ecs.Rest")
 
+	world_add(ECS_CHILDOF, ECS_EXCLUSIVE)
+	world_add(ECS_CHILDOF, ECS_PAIR(ECS_ON_DELETE_TARGET, ECS_DELETE))
+
 	world_add(ECS_ON_DELETE, ECS_EXCLUSIVE)
 	world_add(ECS_ON_DELETE_TARGET, ECS_EXCLUSIVE)
 	world_add(ECS_CHILDOF, ECS_EXCLUSIVE)
@@ -3829,6 +4152,7 @@ return {
 	tag = ANY(PREREGISTER_TAG) :: () -> Entity,
 	meta = ANY(PREREGISTER_METADATA) :: <T>(Entity, Component<T>, T?) -> (),
 
+	ChildOf = ANY(ECS_CHILDOF) :: Entity,
 	Name = ANY(ECS_NAME) :: Component<string>,
 	Exclusive = ANY(ECS_EXCLUSIVE) :: Entity,
 	OnDelete = ANY(ECS_ON_DELETE) :: Entity,
@@ -3836,6 +4160,8 @@ return {
 	Wildcard = ANY(ECS_WILDCARD) :: Entity,
 	Error = ANY(ECS_ERROR) :: Entity,
 	Delete = ANY(ECS_DELETE) :: Entity,
+	Traversable = ANY(ECS_TRAVERSABLE),
+	Disabled = ANY(),
 
 	world = world_new,
 	World = {
