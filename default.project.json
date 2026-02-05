@@ -1,6 +1,6 @@
 {
-	"name": "ecs",
+	"name": "pepecs",
 	"tree": {
-		"$path": "src/init.luau"
+		"$path": "src"
 	}
 }
