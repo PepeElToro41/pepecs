@@ -7,7 +7,7 @@
 			"ecs": {
 				"$className": "Folder",
 				"ecs": {
-					"$path": "src/ecs.luau"
+					"$path": "src/"
 				},
 				"tests": {
 					"$path": "tests"

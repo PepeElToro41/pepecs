@@ -76,7 +76,7 @@ return {
 		jecs = function(profiler)
 			for count, world in jecs_worlds do
 				profiler.Begin(`{count} entities per archetype`)
-				local q = world:query(D1, D2, D3, D4)
+				local q = world:query(B1, B2, B3, B4)
 				q:archetypes()
 				profiler.End()
 			end

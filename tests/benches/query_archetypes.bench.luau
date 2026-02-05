@@ -83,7 +83,7 @@ return {
 
 	Functions = {
 		ecs = function()
-			ecs_world.query(E2, E4, E6, E8).archetypes()
+			ecs_world.query(E2, E4, E6, E8):archetypes()
 		end,
 
 		jecs = function()

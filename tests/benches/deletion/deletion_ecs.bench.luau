@@ -67,7 +67,6 @@ local ecs_benches = {
 		local children = ecs_create_children(world, components)
 
 		local rel = world.entity()
-		world.add(rel, ecs.pair(ecs.OnDeleteTarget, ecs.Remove))
 
 		local parent = world.entity()
 
@@ -99,7 +98,6 @@ local ecs_benches = {
 		local children = ecs_create_children(world, components)
 
 		local parent = world.entity()
-		world.add(parent, ecs.pair(ecs.OnDelete, ecs.Remove))
 
 		for _, child in children do
 			world.add(child, parent)
