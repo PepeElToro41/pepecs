@@ -190,7 +190,7 @@ export type World = {
 	has: (entity: Entity, id: Component) -> boolean,
 	get: & (<A>(Entity, Component<A>) -> A)
 		& (<A, B>(Entity, Component<A>, Component<B>) -> (A, B))
-		& (<A, B, C>(World, Entity, Component<A>, Component<B>, Component<C>) -> (A, B, C))
+		& (<A, B, C>(Entity, Component<A>, Component<B>, Component<C>) -> (A, B, C))
 		& (<A, B, C, D>(Entity, Component<A>, Component<B>, Component<C>, Component<D>) -> (A, B, C, D))
 		& (<A, B, C, D, E>(
 			Entity,

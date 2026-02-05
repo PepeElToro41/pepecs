@@ -7,6 +7,9 @@ repository = "https://github.com/PepeElToro41/pepecs"
 private = false
 includes = ["src/init.luau", "pesde.toml", "README.md", "LICENSE", ".luaurc"]
 
+[indices]
+default = "https://github.com/pesde-pkg/index"
+
 [target]
 environment = "luau"
 lib = "src/init.luau"
