@@ -18,8 +18,14 @@ export type Id<T = any> = { __T: T }
 export type Pair<R, T> = Id<R>
 
 type ArchetypeChangedHook = (source: Archetype, destination: Archetype) -> ()
+
 type SetHook<T = any> = (entity: Entity, id: Id<T>, value: T) -> ()
 type RemovedHook<T = any> = ((entity: Entity, id: Id<T>) -> () -> ()?) | (entity: Entity, id: Id<T>) -> ()?
+
+type PreregisteredSetHook<T = any> = (world: World, entity: Entity, id: Id<T>, value: T) -> ()
+type PreregisteredRemovedHook<T = any> =
+	((world: World, entity: Entity, id: Id<T>) -> () -> ()?)
+	| (world: World, entity: Entity, id: Id<T>) -> ()?
 
 export type ArchetypeMatch = (archetype: Archetype) -> boolean
 
@@ -113,6 +119,9 @@ export type Archetype = {
 	columns_map: { [u53]: Column },
 	forward_edges: Map<u53, Archetype>,
 	backwards_edges: Map<u53, Archetype>,
+
+	traversable_count: number,
+	traversable_ids: { u53 },
 }
 
 export type EntityRecord = {
@@ -124,9 +133,31 @@ export type EntityRecord = {
 	archetype_changed: { ArchetypeChangedHook }?,
 }
 
+type ReachableElement = {
+	archetype: Archetype,
+	record: EntityRecord,
+	entity: u53,
+}
+
+type ReachableCache = {
+	generation: number,
+	current: number,
+	ids: Map<u53, ReachableElement>,
+}
+
 export type PairRecord = ComponentRecord & {
 	pairs_count: Map<ArchetypeId, number>,
-	pair_records: Map<u53, ComponentRecord>,
+
+	-- all records that share the same relation: (R, *)
+	first_records: Map<u53, PairRecord>,
+	-- all records that share the same target: (*, T)
+	second_records: Map<u53, PairRecord>,
+	-- all records with a traversable relation that share the same target:
+	-- (R, T) where R is any id with ECS_TRAVERSABLE trait
+	trav_records: Map<u53, PairRecord>,
+
+	-- To find which components are reachable through the relation
+	reachable: ReachableCache,
 }
 
 export type ComponentRecord = {
@@ -135,17 +166,16 @@ export type ComponentRecord = {
 	archetype_count: number,
 	flags: Bitset,
 
-	on_added: { SetHook }?,
-	on_changed: { SetHook }?,
-	on_removed: { RemovedHook }?,
+	on_added: Array<{ SetHook }>?,
+	on_changed: Array<{ SetHook }>?,
+	on_removed: Array<{ RemovedHook }>?,
 
-	monitors: { QueryIdMonitor }?,
-	inherited: ComponentRecord?,
+	monitors: Array<{ QueryIdMonitor }>?,
 
 	-- observers_added will fire when the entity's archetype changes
 	-- observers_changed will fire when the column value changes
-	observers_added: { QueryIdObserver }?,
-	observers_changed: { QueryIdObserver }?,
+	observers_added: Array<{ QueryIdObserver }>?,
+	observers_changed: Array<{ QueryIdObserver }>?,
 }
 
 export type ComponentsLookup = Map<u53, ComponentRecord>
@@ -312,15 +342,15 @@ export type World = {
 		) -> Query<A, B, C, D, E, F, G, H>),
 }
 
-local preregistered_count = 0
-local preregistered_components: Map<u53, true> = {}
-local preregistered_metadata: Map<u53, Map<u53, any>> = {}
-
 local MAX_COMPONENT_ID: number = _G.ECS_MAX_COMPONENT_ID or 256
 
 local ENTITY_MASK = bit32.lshift(1, 24)
 local GENERATION_MASK = bit32.lshift(1, 16)
 local PAIR_OFFSET = 2 ^ 48
+
+local PAIR_HOOK_INDEX = 1
+local RELATION_WC_HOOK_INDEX = 2
+local TARGET_WC_HOOK_INDEX = 3
 
 --[[
 local BITSET_RANGE = 32
@@ -340,15 +370,27 @@ local ECS_ON_DELETE = 		   MAX_COMPONENT_ID +  8
 local ECS_ERROR = 			   MAX_COMPONENT_ID +  9
 local ECS_TRAVERSABLE = 	   MAX_COMPONENT_ID + 10
 local ECS_DISABLED = 		   MAX_COMPONENT_ID + 11
-local ECS_REST = 			   MAX_COMPONENT_ID + 12
+local ECS_PAIR_IS_TAG = 	   MAX_COMPONENT_ID + 12
+local ECS_REST = 			   MAX_COMPONENT_ID + 13
 -- stylua: ignore end
 
 local IS_COMPONENT_FLAG = bit32.lshift(1, 0)
 local IS_EXCLUSIVE_FLAG = bit32.lshift(1, 1)
+local IS_TRAVERSABLE_FLAG = bit32.lshift(1, 3)
 local HAS_DELETE_FLAG = bit32.lshift(1, 2)
 
 local NULL_ARRAY = table.freeze {} :: { any }
 local NULL_VALUE = newproxy()
+
+local preregistered_components_count = 0
+local preregistered_components: Map<u53, true> = {}
+local preregistered_entities_count = ECS_REST
+local preregistered_metadata: Map<u53, Map<u53, any>> = {}
+local preregistered_hooks = {
+	added = {} :: Map<u53, Array<{ hook: PreregisteredSetHook, disconnect: Cleanup }>>,
+	changed = {} :: Map<u53, Array<{ hook: PreregisteredSetHook, disconnect: Cleanup }>>,
+	removed = {} :: Map<u53, Array<{ hook: PreregisteredRemovedHook, disconnect: Cleanup }>>,
+}
 
 local function NOOP() end
 
@@ -399,17 +441,37 @@ local function FIND_INSERT(ids: { u53 }, added: u53)
 	return #ids + 1
 end
 
+local function INSERT_COMPONENT_HOOK<T>(callback: T, hooks: { T }?): ({ T }, Cleanup)
+	if hooks then
+		table.insert(hooks, callback)
+	else
+		hooks = { callback }
+	end
+
+	local function disconnect()
+		local index = table.find(hooks :: { any }, callback)
+		if index then
+			table.remove(hooks :: { any }, index)
+		end
+	end
+
+	return hooks :: Array<{ T }>, disconnect
+end
+
 local function PREREGISTER_COMPONENT()
-	local id = MAX_COMPONENT_ID - preregistered_count
-	preregistered_count += 1
-	preregistered_components[id] = true
-	return id
+	preregistered_components_count += 1
+	preregistered_components[preregistered_components_count] = true
+	return preregistered_components_count
 end
 
 local function PREREGISTER_TAG()
-	local id = MAX_COMPONENT_ID - preregistered_count
-	preregistered_count += 1
-	return id
+	preregistered_components_count += 1
+	return preregistered_components_count
+end
+
+local function PREREGISTER_ENTITY()
+	preregistered_entities_count += 1
+	return preregistered_entities_count
 end
 
 local function PREREGISTER_METADATA<T>(entity: u53, id: u53, value: T?)
@@ -419,6 +481,53 @@ local function PREREGISTER_METADATA<T>(entity: u53, id: u53, value: T?)
 		preregistered_metadata[entity] = meta
 	end
 	meta[id] = if value == nil then NULL_VALUE else value
+end
+
+-- TODO: I believe disconnecting it this way will prevent worlds from being garbage collected
+
+local function PREREGISTER_ADDED_HOOK(id: u53, callback: PreregisteredSetHook)
+	local new_hook: { hook: PreregisteredSetHook, disconnect: Cleanup } = {
+		hook = callback,
+		disconnect = nil :: any,
+	}
+
+	local hooks, disconnect = INSERT_COMPONENT_HOOK(new_hook, preregistered_hooks.added[id])
+	preregistered_hooks.added[id] = hooks
+	new_hook.disconnect = disconnect
+
+	return function()
+		new_hook.disconnect()
+	end
+end
+
+local function PREREGISTER_CHANGED_HOOK(id: u53, callback: PreregisteredSetHook)
+	local new_hook: { hook: PreregisteredSetHook, disconnect: Cleanup } = {
+		hook = callback,
+		disconnect = nil :: any,
+	}
+
+	local hooks, disconnect = INSERT_COMPONENT_HOOK(new_hook, preregistered_hooks.changed[id])
+	preregistered_hooks.changed[id] = hooks
+	new_hook.disconnect = disconnect
+
+	return function()
+		new_hook.disconnect()
+	end
+end
+
+local function PREREGISTER_REMOVED_HOOK(id: u53, callback: PreregisteredRemovedHook)
+	local new_hook: { hook: PreregisteredRemovedHook, disconnect: Cleanup } = {
+		hook = callback,
+		disconnect = nil :: any,
+	}
+
+	local hooks, disconnect = INSERT_COMPONENT_HOOK(new_hook, preregistered_hooks.removed[id])
+	preregistered_hooks.removed[id] = hooks
+	new_hook.disconnect = disconnect
+
+	return function()
+		new_hook.disconnect()
+	end
 end
 
 --[[
@@ -465,27 +574,86 @@ local function REMOVE_ALL_PAIRS(components: { u53 }, components_count: number, p
 	return destination_ids
 end
 
-local function FIRE_SET_HOOKS(hooks: { SetHook }, entity: u53, id: u53, data: any)
-	for _, hook in hooks do
-		hook(entity :: any, id :: any, data)
+local function FIRE_SET_HOOKS(all_hooks: Array<{ SetHook }>, entity: u53, id: u53, data: any)
+	for _, hooks in all_hooks do
+		for _, hook in hooks do
+			hook(entity :: any, id :: any, data)
+		end
 	end
 end
 
-local function FIRE_REMOVE_HOOKS(hooks: { RemovedHook }, entity: u53, id: u53, append_to: { () -> () }?)
+local function FIRE_REMOVE_HOOKS(all_hooks: Array<{ RemovedHook }>, entity: u53, id: u53, append_to: { () -> () }?)
 	local post_removed_callbacks: { () -> () }? = append_to
 
-	for _, hook: any in hooks do
-		local post_removed = hook(entity :: any, id :: any) :: () -> ()
-		if post_removed then
-			if post_removed_callbacks then
-				table.insert(post_removed_callbacks, post_removed)
-			else
-				post_removed_callbacks = { post_removed }
+	for _, hooks in all_hooks do
+		for _, hook in hooks :: any do
+			local post_removed = hook(entity, id) :: () -> ()
+			if post_removed then
+				if post_removed_callbacks then
+					table.insert(post_removed_callbacks, post_removed)
+				else
+					post_removed_callbacks = { post_removed }
+				end
 			end
 		end
 	end
 
 	return post_removed_callbacks
+end
+
+local function PROPAGATE_PAIR_EVENTS<T>(
+	world: World,
+	id: u53,
+	pair_record: PairRecord,
+	all_hooks: Array<{ T }>,
+	get_hooks: (PairRecord) -> Array<{ T }>?,
+	set_hooks: (PairRecord, Array<{ T }>) -> ()
+)
+	local hooks = all_hooks[PAIR_HOOK_INDEX]
+
+	local relation_wildcard = ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)
+	local target_wildcard = ECS_PAIR(ECS_WILDCARD, PAIR_SECOND(id))
+
+	if relation_wildcard == id then
+		for _, relation_record in pair_record.first_records do
+			local relation_hooks = get_hooks(relation_record)
+			if relation_hooks then
+				relation_hooks[RELATION_WC_HOOK_INDEX] = hooks
+			else
+				set_hooks(relation_record, { [PAIR_HOOK_INDEX] = {}, [RELATION_WC_HOOK_INDEX] = hooks })
+			end
+		end
+	elseif target_wildcard == id then
+		for _, target_record in pair_record.second_records do
+			local target_hooks = get_hooks(target_record)
+			if target_hooks then
+				target_hooks[RELATION_WC_HOOK_INDEX] = target_hooks[RELATION_WC_HOOK_INDEX] or {}
+				target_hooks[TARGET_WC_HOOK_INDEX] = hooks
+			else
+				set_hooks(target_record, {
+					[PAIR_HOOK_INDEX] = {},
+					[RELATION_WC_HOOK_INDEX] = {},
+					[TARGET_WC_HOOK_INDEX] = hooks,
+				})
+			end
+		end
+	else
+		local components_lookup = world.components_lookup
+		local relation_record = components_lookup[relation_wildcard] :: PairRecord
+		local target_record = components_lookup[target_wildcard] :: PairRecord
+
+		local relation_hooks = get_hooks(relation_record)
+		local target_hooks = get_hooks(target_record)
+
+		if target_hooks then
+			if not relation_hooks then
+				all_hooks[RELATION_WC_HOOK_INDEX] = {}
+			end
+			all_hooks[TARGET_WC_HOOK_INDEX] = target_hooks[PAIR_HOOK_INDEX]
+		elseif relation_hooks then
+			all_hooks[RELATION_WC_HOOK_INDEX] = relation_hooks[PAIR_HOOK_INDEX]
+		end
+	end
 end
 
 local function FIRE_MONITOR(monitor: QueryIdMonitor, entity: u53, source: Archetype, destination: Archetype)
@@ -537,16 +705,25 @@ local function FIRE_MONITOR_ENTITIES(
 	end
 end
 
-local function FIRE_QUERY_MONITORS(monitors: { QueryIdMonitor }, entity: u53, source: Archetype, destination: Archetype)
-	for _, monitor in monitors do
-		FIRE_MONITOR(monitor, entity, source, destination)
+local function FIRE_QUERY_MONITORS(
+	all_monitors: Array<{ QueryIdMonitor }>,
+	entity: u53,
+	source: Archetype,
+	destination: Archetype
+)
+	for _, monitors in all_monitors do
+		for _, monitor in monitors do
+			FIRE_MONITOR(monitor, entity, source, destination)
+		end
 	end
 end
 
-local function FIRE_QUERY_OBSERVERS(observers: { QueryIdObserver }, entity: u53, archetype: Archetype)
-	for _, observer in observers do
-		if observer.match(archetype) then
-			observer.callback(entity)
+local function FIRE_QUERY_OBSERVERS(all_observers: Array<{ QueryIdObserver }>, entity: u53, archetype: Archetype)
+	for _, observers in all_observers do
+		for _, observer in observers do
+			if observer.match(archetype) then
+				observer.callback(entity)
+			end
 		end
 	end
 end
@@ -563,6 +740,9 @@ end
 -- to prevent them from firing multiple times as a single monitor subscribes to multiple components at the same time.
 -- multiple monitors that belong to the same query are ovewritten and fired once per query
 -- its slower but keeps monitors reliable
+
+-- TODO: find another solution, monitors/observers could check if the destination and entity repeats.
+-- Or an operation id could be generated and passed, to check if the operation is the same
 local function ACCUMULATE_MONITORS_SET(
 	component_record: ComponentRecord,
 	monitors_set: Map<QueryIdMonitor, true>?,
@@ -570,35 +750,36 @@ local function ACCUMULATE_MONITORS_SET(
 	observers_changed_set: Map<QueryIdObserver, true>?
 )
 	if monitors_set then
-		local monitors = component_record.monitors
-		if monitors then
-			for _, monitor in monitors do
-				monitors_set[monitor] = true
+		local all_monitors = component_record.monitors
+		if all_monitors then
+			for _, monitors in all_monitors do
+				for _, monitor in monitors do
+					monitors_set[monitor] = true
+				end
 			end
 		end
 	end
 
 	if observers_added_set then
-		local observers_added = component_record.observers_added
-		if observers_added then
-			for _, observer in observers_added do
-				observers_added_set[observer] = true
+		local all_observers = component_record.observers_added
+		if all_observers then
+			for _, observers in all_observers do
+				for _, observer in observers do
+					observers_added_set[observer] = true
+				end
 			end
 		end
 	end
 
 	if observers_changed_set then
-		local observers_changed = component_record.observers_changed
-		if observers_changed then
-			for _, observer in observers_changed do
-				observers_changed_set[observer] = true
+		local all_observers = component_record.observers_changed
+		if all_observers then
+			for _, observers in all_observers do
+				for _, observer in observers do
+					observers_changed_set[observer] = true
+				end
 			end
 		end
-	end
-
-	local inherited = component_record.inherited
-	if inherited then
-		ACCUMULATE_MONITORS_SET(inherited, monitors_set, observers_added_set, observers_changed_set)
 	end
 end
 
@@ -809,19 +990,30 @@ local function observer_new(
 		match = query_match,
 		callback = callback,
 	}
+
 	local inserted_in: { { QueryIdObserver } } = {}
 
 	local function insert_added_observers(ids: { u53 })
 		for _, id in ids do
 			local component_record = component_record_ensure(id)
-			local observers = component_record.observers_added
-			if observers then
+			local all_observers = component_record.observers_added
+			if all_observers then
+				local observers = all_observers[PAIR_HOOK_INDEX]
 				table.insert(observers, query_observer)
+				table.insert(inserted_in, observers)
 			else
-				observers = { query_observer }
-				component_record.observers_added = observers
+				local observers = { [PAIR_HOOK_INDEX] = query_observer }
+				local all_observers = { observers }
+				component_record.observers_added = all_observers
+
+				PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_observers, function(record)
+					return record.observers_added
+				end, function(record, set_observers)
+					record.observers_added = set_observers
+				end)
+
+				table.insert(inserted_in, observers)
 			end
-			table.insert(inserted_in, observers :: { QueryIdObserver })
 		end
 	end
 
@@ -832,14 +1024,24 @@ local function observer_new(
 
 	for _, id in terms do
 		local component_record = component_record_ensure(id)
-		local observers = component_record.observers_changed
-		if observers then
+		local all_observers = component_record.observers_changed
+		if all_observers then
+			local observers = all_observers[PAIR_HOOK_INDEX]
 			table.insert(observers, query_observer)
+			table.insert(inserted_in, observers)
 		else
-			observers = { query_observer }
-			component_record.observers_changed = observers
+			local observers = { [PAIR_HOOK_INDEX] = query_observer }
+			local all_observers = { observers }
+			component_record.observers_changed = all_observers
+
+			PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_observers, function(record)
+				return record.observers_changed
+			end, function(record, set_observers)
+				record.observers_changed = set_observers
+			end)
+
+			table.insert(inserted_in, observers)
 		end
-		table.insert(inserted_in, observers :: { QueryIdObserver })
 	end
 
 	return function()
@@ -880,14 +1082,24 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 	local function insert_monitors(ids: { u53 })
 		for _, id in ids do
 			local component_record = component_record_ensure(id)
-			local monitors = component_record.monitors
-			if monitors then
+			local all_monitors = component_record.monitors
+			if all_monitors then
+				local monitors = all_monitors[PAIR_HOOK_INDEX]
 				table.insert(monitors, query_monitor)
+				table.insert(inserted_in, monitors)
 			else
-				monitors = { query_monitor }
-				component_record.monitors = monitors
+				local monitors = { [PAIR_HOOK_INDEX] = query_monitor }
+				local all_monitors = { monitors }
+				component_record.monitors = all_monitors
+
+				PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_monitors, function(record)
+					return record.monitors
+				end, function(record, set_monitors)
+					record.monitors = set_monitors
+				end)
+
+				table.insert(inserted_in, monitors)
 			end
-			table.insert(inserted_in, monitors :: { QueryIdMonitor })
 		end
 	end
 
@@ -944,13 +1156,13 @@ local function query_changed_new(world: World, terms: { u53 }, with_ids: { u53 }
 		iter_queue = {}
 		iter_indexes = {}
 
-		return function(): (u53, ...any)
+		return function(): (u53, any)
 			if row == 0 then
 				return nil :: any
 			end
 			local entity = now_queue[row]
 			row -= 1
-			return entity, world.get(entity :: any, unpack(terms :: { any }))
+			return entity, (world.get :: any)(entity, unpack(terms))
 		end
 	end
 
@@ -2297,7 +2509,7 @@ local function world_new()
 	local archetypes: Map<ArchetypeId, Archetype> = {}
 	local archetypes_lookup: Map<string, Archetype> = {}
 
-	local component_count = 0
+	local component_count = preregistered_components_count
 	local components_lookup = table.create(ECS_REST) :: ComponentsLookup
 
 	local archetype_creation_observers: Map<u53, { ArchetypeObserver }> = {}
@@ -2321,6 +2533,8 @@ local function world_new()
 		columns_map = {},
 		forward_edges = {},
 		backwards_edges = {},
+		traversable_count = 0,
+		traversable_ids = {},
 	}
 	archetypes[1] = ROOT_ARCHETYPE
 	archetypes_lookup[""] = ROOT_ARCHETYPE
@@ -2514,6 +2728,20 @@ local function world_new()
 		end
 	end
 
+	local function check_is_component(relation: u53, target: u53?)
+		if target and world_has(relation, ECS_PAIR_IS_TAG) then
+			return false
+		end
+
+		local is_component = world_has(relation, ECS_COMPONENT)
+
+		if target and not is_component then
+			is_component = world_has(target, ECS_COMPONENT)
+		end
+
+		return is_component
+	end
+
 	local function component_record_create(id: u53)
 		local is_pair = IS_PAIR(id)
 		local relation = id
@@ -2542,18 +2770,12 @@ local function world_new()
 
 			local pair_record = record :: PairRecord
 			pair_record.pairs_count = {}
-			pair_record.pair_records = {}
+			pair_record.first_records = {}
+			pair_record.second_records = {}
+			pair_record.trav_records = {}
 		end
 
-		local is_component = world_has(relation, ECS_COMPONENT) or preregistered_components[id]
-
-		if world_has(relation, ECS_PAIR(ECS_ON_DELETE, ECS_DELETE)) then
-			has_delete = true
-		end
-
-		if target and not is_component then
-			is_component = world_has(target, ECS_COMPONENT)
-		end
+		local is_component = check_is_component(relation, target)
 
 		record.flags = bit32.bor(
 			(is_component and IS_COMPONENT_FLAG) or 0,
@@ -2565,13 +2787,132 @@ local function world_new()
 		return record
 	end
 
+	local function get_pair_wildcards(id: u53): (u53, u53)
+		local relation = get_entity_alive(PAIR_FIRST(id)) :: number
+		local target = get_entity_alive(PAIR_SECOND(id)) :: number
+
+		local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
+		local target_wildcard = ECS_PAIR(ECS_WILDCARD, target)
+
+		return relation_wildcard, target_wildcard
+	end
+
+	local function wildcard_record_ensure(wildcard: u53): PairRecord
+		local wildcard_record = components_lookup[wildcard]
+		if not wildcard_record then
+			wildcard_record = component_record_create(wildcard)
+			components_lookup[wildcard] = wildcard_record
+		end
+		return wildcard_record :: PairRecord
+	end
+
+	local function merge_pair_relation_events<T>(relation_hooks: Array<{ T }>, all_hooks: Array<{ T }>?): Array<{ T }>
+		if all_hooks then
+			all_hooks[RELATION_WC_HOOK_INDEX] = relation_hooks[PAIR_HOOK_INDEX]
+		else
+			all_hooks = {
+				[PAIR_HOOK_INDEX] = {},
+				[RELATION_WC_HOOK_INDEX] = relation_hooks[PAIR_HOOK_INDEX],
+			}
+		end
+		return all_hooks :: Array<{ T }>
+	end
+	local function merge_pair_target_events<T>(target_hooks: Array<{ T }>, all_hooks: Array<{ T }>?): Array<{ T }>
+		if all_hooks then
+			all_hooks[RELATION_WC_HOOK_INDEX] = all_hooks[RELATION_WC_HOOK_INDEX] or {}
+			all_hooks[TARGET_WC_HOOK_INDEX] = target_hooks[PAIR_HOOK_INDEX]
+		else
+			all_hooks = {
+				[PAIR_HOOK_INDEX] = {},
+				[RELATION_WC_HOOK_INDEX] = {},
+				[TARGET_WC_HOOK_INDEX] = target_hooks[PAIR_HOOK_INDEX],
+			}
+		end
+		return all_hooks :: Array<{ T }>
+	end
+
 	local function component_record_ensure(id: u53)
 		local record = components_lookup[id]
 		if record then
 			return record
 		end
 
-		return component_record_create(id)
+		local is_pair = IS_PAIR(id)
+		if is_pair then
+			local record = component_record_create(id) :: PairRecord
+
+			local relation_wildcard = ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)
+			local target_wildcard = ECS_PAIR(ECS_WILDCARD, PAIR_SECOND(id))
+
+			if relation_wildcard == id or target_wildcard == id then
+				return record
+			end
+
+			local relation_record = wildcard_record_ensure(relation_wildcard)
+			relation_record.first_records[id] = record
+
+			local rel_on_added = relation_record.on_added
+			local rel_on_changed = relation_record.on_changed
+			local rel_on_removed = relation_record.on_removed
+			local rel_monitors = relation_record.monitors
+			local rel_observers_added = relation_record.observers_added
+			local rel_observers_changed = relation_record.observers_changed
+
+			if rel_on_added then
+				record.on_added = merge_pair_relation_events(rel_on_added, record.on_added)
+			end
+			if rel_on_changed then
+				record.on_changed = merge_pair_relation_events(rel_on_changed, record.on_changed)
+			end
+			if rel_on_removed then
+				record.on_removed = merge_pair_relation_events(rel_on_removed, record.on_removed)
+			end
+			if rel_monitors then
+				record.monitors = merge_pair_relation_events(rel_monitors, record.monitors)
+			end
+			if rel_observers_added then
+				record.observers_added = merge_pair_relation_events(rel_observers_added, record.observers_added)
+			end
+			if rel_observers_changed then
+				record.observers_changed = merge_pair_relation_events(rel_observers_changed, record.observers_changed)
+			end
+
+			local target_record = wildcard_record_ensure(target_wildcard)
+			target_record.second_records[id] = record
+			if CHECK_FLAG(relation_record.flags, IS_TRAVERSABLE_FLAG) then
+				target_record.trav_records[id] = record
+			end
+
+			local tgt_on_added = target_record.on_added
+			local tgt_on_changed = target_record.on_changed
+			local tgt_on_removed = target_record.on_removed
+			local tgt_monitors = target_record.monitors
+			local tgt_observers_added = target_record.observers_added
+			local tgt_observers_changed = target_record.observers_changed
+
+			if tgt_on_added then
+				record.on_added = merge_pair_target_events(tgt_on_added, record.on_added)
+			end
+			if tgt_on_changed then
+				record.on_changed = merge_pair_target_events(tgt_on_changed, record.on_changed)
+			end
+			if tgt_on_removed then
+				record.on_removed = merge_pair_target_events(tgt_on_removed, record.on_removed)
+			end
+			if tgt_monitors then
+				record.monitors = merge_pair_target_events(tgt_monitors, record.monitors)
+			end
+			if tgt_observers_added then
+				record.observers_added = merge_pair_target_events(tgt_observers_added, record.observers_added)
+			end
+			if tgt_observers_changed then
+				record.observers_changed = merge_pair_target_events(tgt_observers_changed, record.observers_changed)
+			end
+
+			return record
+		else
+			return component_record_create(id)
+		end
 	end
 
 	local function fire_created_archetype(archetype: Archetype, id: u53)
@@ -2798,6 +3139,9 @@ local function world_new()
 			columns_map = columns_map,
 			forward_edges = {},
 			backwards_edges = {},
+
+			traversable_count = 0,
+			traversable_ids = {},
 		}
 
 		for index, id in ids do
@@ -2812,29 +3156,22 @@ local function world_new()
 			id_record.column_index[archetype_id] = index
 
 			if IS_PAIR(id) then
-				local relation = PAIR_FIRST(id)
-				local target = PAIR_SECOND(id)
+				local relation_wildcard, target_wildcard = get_pair_wildcards(id)
 
-				local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
-				local relation_record = component_record_ensure(relation_wildcard) :: PairRecord
+				local relation_record = components_lookup[relation_wildcard] :: PairRecord
 				relation_record.archetype_count += 1
+
+				if CHECK_FLAG(relation_record.flags, IS_TRAVERSABLE_FLAG) then
+					archetype.traversable_count += 1
+					table.insert(archetype.traversable_ids, id)
+				end
 
 				local relation_appended = archetype_append_to_pair(relation_record, archetype_id, index)
 				if relation_appended then
 					columns_map[relation_wildcard] = column
 				end
 
-				local pair_records = relation_record.pair_records
-				if pair_records then
-					pair_records[id] = id_record
-				else
-					relation_record.pair_records = {
-						[id] = id_record,
-					}
-				end
-
-				local target_wildcard = ECS_PAIR(ECS_WILDCARD, target)
-				local target_record = component_record_ensure(target_wildcard) :: PairRecord
+				local target_record = components_lookup[target_wildcard] :: PairRecord
 				target_record.archetype_count += 1
 
 				local target_appended = archetype_append_to_pair(target_record, archetype_id, index)
@@ -2886,21 +3223,21 @@ local function world_new()
 		return destination
 	end
 
-	local function archetype_find_swap_with(source: Archetype, swapped: u53, id: u53, at: number)
+	local function archetype_find_swap_with(source: Archetype, old: u53, new: u53, column: number)
 		local forward_edges = source.forward_edges
-		local destination = forward_edges[id]
+		local destination = forward_edges[new]
 
 		if not destination then
 			local destination_components = table.clone(source.components)
-			destination_components[at] = id
+			destination_components[column] = new
 
 			local found = archetype_ensure(destination_components)
-			forward_edges[id] = found
+			forward_edges[new] = found
 
 			local backwards_edges = source.backwards_edges
-			local root = backwards_edges[swapped]
+			local root = backwards_edges[old]
 			if root then
-				root.forward_edges[id] = found
+				root.forward_edges[new] = found
 			end
 
 			return found
@@ -3006,19 +3343,16 @@ local function world_new()
 		if column then
 			column[record.archetype_row] = data
 
-			local component_record: ComponentRecord? = components_lookup[id]
-			while component_record do
-				local observers = component_record.observers_changed
-				if observers then
-					FIRE_QUERY_OBSERVERS(observers, entity, source)
-				end
+			local component_record = components_lookup[id]
 
-				local changed_hooks = component_record.on_changed
-				if changed_hooks then
-					FIRE_SET_HOOKS(changed_hooks, entity, id, data)
-				end
+			local observers = component_record.observers_changed
+			if observers then
+				FIRE_QUERY_OBSERVERS(observers, entity, source)
+			end
 
-				component_record = component_record.inherited
+			local changed_hooks = component_record.on_changed
+			if changed_hooks then
+				FIRE_SET_HOOKS(changed_hooks, entity, id, data)
 			end
 		else
 			local swapped_record: PairRecord
@@ -3062,19 +3396,19 @@ local function world_new()
 			new_column[record.archetype_row] = data
 
 			if swapped_record then
-				local swap_monitor = swapped_record.monitors
-				if swap_monitor then
-					FIRE_QUERY_MONITORS(swap_monitor, entity, source, destination)
+				local swap_monitors = swapped_record.monitors
+				if swap_monitors then
+					FIRE_QUERY_MONITORS(swap_monitors, entity, source, destination)
 				end
 
-				local rel_observers = swapped_record.observers_added
-				if rel_observers then
-					FIRE_QUERY_OBSERVERS(rel_observers, entity, destination)
+				local swap_observers = swapped_record.observers_added
+				if swap_observers then
+					FIRE_QUERY_OBSERVERS(swap_observers, entity, destination)
 				end
 			end
 
-			local component_record: ComponentRecord? = components_lookup[id]
-			while component_record do
+			local component_record = components_lookup[id]
+			if component_record then
 				local monitors = component_record.monitors
 				if monitors then
 					FIRE_QUERY_MONITORS(monitors, entity, source, destination)
@@ -3089,7 +3423,6 @@ local function world_new()
 				if added_hooks then
 					FIRE_SET_HOOKS(added_hooks, entity, id, data)
 				end
-				component_record = component_record.inherited
 			end
 
 			if post_removed then
@@ -3149,20 +3482,19 @@ local function world_new()
 		end
 
 		if swapped_record then
-			local swap_monitor = swapped_record.monitors
-			if swap_monitor then
-				FIRE_QUERY_MONITORS(swap_monitor, entity, source, destination)
+			local swap_monitors = swapped_record.monitors
+			if swap_monitors then
+				FIRE_QUERY_MONITORS(swap_monitors, entity, source, destination)
 			end
 
-			local rel_observers = swapped_record.observers_added
-			if rel_observers then
-				FIRE_QUERY_OBSERVERS(rel_observers, entity, destination)
+			local swap_observers = swapped_record.observers_added
+			if swap_observers then
+				FIRE_QUERY_OBSERVERS(swap_observers, entity, destination)
 			end
 		end
 
-		local component_record: ComponentRecord? = components_lookup[id]
-
-		while component_record do
+		local component_record = components_lookup[id]
+		if component_record then
 			local monitors = component_record.monitors
 			if monitors then
 				FIRE_QUERY_MONITORS(monitors, entity, source, destination)
@@ -3177,8 +3509,6 @@ local function world_new()
 			if added_hooks then
 				FIRE_SET_HOOKS(added_hooks, entity, id)
 			end
-
-			component_record = component_record.inherited
 		end
 
 		if post_removed then
@@ -3226,7 +3556,7 @@ local function world_new()
 		end
 	end
 
-	local function archetype_swap_to(
+	local function archetype_move_entities_to(
 		archetype: Archetype,
 		entities: { u53 },
 		affected: Map<u53, ComponentRecord>,
@@ -3281,9 +3611,9 @@ local function world_new()
 		archetype: Archetype,
 		id: u53,
 		entities: { u53 },
-		on_removed: { RemovedHook }?,
-		monitors: { QueryIdMonitor }?,
-		observers_added: { QueryIdObserver }?
+		on_removed: Array<{ RemovedHook }>?,
+		all_monitors: Array<{ QueryIdMonitor }>?,
+		all_observers: Array<{ QueryIdObserver }>?
 	)
 		local destination = archetype_find_without(archetype, id)
 		local post_removed_callbacks: { () -> () }?
@@ -3297,17 +3627,21 @@ local function world_new()
 
 		archetype_bulk_move_entities(archetype, destination, entities)
 
-		if monitors then
-			for _, monitor in monitors do
-				FIRE_MONITOR_ENTITIES(monitor, entities, archetype, destination)
+		if all_monitors then
+			for _, monitors in all_monitors do
+				for _, monitor in monitors do
+					FIRE_MONITOR_ENTITIES(monitor, entities, archetype, destination)
+				end
 			end
 		end
 
-		if observers_added then
-			for _, observer in observers_added do
-				if observer.match(destination) then
-					for _, entity in entities do
-						observer.callback(entity)
+		if all_observers then
+			for _, observers in all_observers do
+				for _, observer in observers do
+					if observer.match(destination) then
+						for _, entity in entities do
+							observer.callback(entity)
+						end
 					end
 				end
 			end
@@ -3463,7 +3797,7 @@ local function world_new()
 						end
 
 						local destination = archetype_ensure(destination_ids)
-						archetype_swap_to(archetype, entities, removing, destination)
+						archetype_move_entities_to(archetype, entities, removing, destination)
 					end
 				end
 
@@ -3514,7 +3848,7 @@ local function world_new()
 								local id_record = components_lookup[id]
 								affected[id] = id_record
 							end
-							archetype_swap_to(archetype, entities, affected, ROOT_ARCHETYPE)
+							archetype_move_entities_to(archetype, entities, affected, ROOT_ARCHETYPE)
 						else
 							for i = pair_start, id_count do
 								local id = components[i]
@@ -3523,7 +3857,7 @@ local function world_new()
 							end
 							local destination_ids = REMOVE_ALL_PAIRS(components, components_count, pair_start, id_count)
 							local destination = archetype_ensure(destination_ids)
-							archetype_swap_to(archetype, entities, affected, destination)
+							archetype_move_entities_to(archetype, entities, affected, destination)
 						end
 					end
 				end
@@ -3584,7 +3918,7 @@ local function world_new()
 			-- notifying
 			local monitors_set: Map<QueryIdMonitor, true> = {}
 			local observers_added_set: Map<QueryIdObserver, true> = {}
-			local firing_hooks: Map<number, { SetHook }> = {}
+			local firing_hooks: Map<number, Array<{ SetHook }>> = {}
 
 			-- hooks are added in an array to keep the same order things are fired
 			-- monitors/observers sets are fired before changed hooks
@@ -3634,7 +3968,7 @@ local function world_new()
 
 				local monitors_set: Map<QueryIdMonitor, true> = {}
 				local observers_added_set: Map<QueryIdObserver, true> = {}
-				local firing_hooks: Map<number, { SetHook }> = {}
+				local firing_hooks: Map<number, Array<{ SetHook }>> = {}
 
 				for _, index in inserted do
 					local id = ids[index]
@@ -3677,7 +4011,7 @@ local function world_new()
 			-- notifying
 			local monitors_set: Map<QueryIdMonitor, true> = {}
 			local observers_added_set: Map<QueryIdObserver, true> = {}
-			local firing_hooks: Map<number, { SetHook }> = {}
+			local firing_hooks: Map<number, Array<{ SetHook }>> = {}
 
 			for index, id in ids do
 				local component_record = components_lookup[id]
@@ -3729,13 +4063,13 @@ local function world_new()
 			if destination ~= source then
 				local monitors_set: Map<QueryIdMonitor, true> = {}
 				local observers_set: Map<QueryIdObserver, true> = {}
-				local firing_hooks: Map<number, { SetHook }> = {}
+				local firing_hooks: Map<number, Array<{ SetHook }>> = {}
 
 				for index, was_inserted in inserted do
 					local id = ids[index]
 					local component_record = components_lookup[id]
 
-					local hooks: { SetHook }? = nil
+					local hooks: Array<{ SetHook }>? = nil
 					if was_inserted then
 						-- accumulates monitors and observers_added
 						ACCUMULATE_MONITORS_SET(component_record, monitors_set, observers_set)
@@ -3761,7 +4095,7 @@ local function world_new()
 				end
 			else
 				local observers_changed_set: Map<QueryIdObserver, true> = {}
-				local firing_hooks: Map<number, { SetHook }> = {}
+				local firing_hooks: Map<number, Array<{ SetHook }>> = {}
 
 				for index, id in ids do
 					local component_record = components_lookup[id]
@@ -3837,7 +4171,7 @@ local function world_new()
 
 	local function world_tag(): u24
 		component_count += 1
-		if component_count > (MAX_COMPONENT_ID - preregistered_count) then
+		if component_count > MAX_COMPONENT_ID then
 			error "max components exceeded, consider changing _G.ECS_MAX_COMPONENT_ID"
 		end
 		return component_count
@@ -3867,13 +4201,16 @@ local function world_new()
 		local archetype_id = archetype.archetype_id
 		local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
 		local pair_record = components_lookup[relation_wildcard] :: PairRecord
+		if not pair_record then
+			return nil
+		end
 		local pairs_count = pair_record.pairs_count[archetype_id]
 
 		if not pairs_count then
 			return nil
 		end
 		local nth = index or 0
-		if pairs_count >= nth then
+		if nth >= pairs_count then
 			return nil
 		end
 
@@ -3996,51 +4333,26 @@ local function world_new()
 		return not record.deleting
 	end
 
-	local function is_component(id: u53)
-		local record = component_record_ensure(id)
-		return CHECK_FLAG(record.flags, IS_COMPONENT_FLAG)
-	end
-
-	local function is_tag(id: u53)
-		return not is_component(id)
-	end
-
-	local function insert_component_hook<T>(callback: T, hooks: { T }?)
-		if hooks then
-			table.insert(hooks, callback)
+	local function world_is_component(id: u53)
+		local record = components_lookup[id]
+		if record then
+			return CHECK_FLAG(record.flags, IS_COMPONENT_FLAG)
 		else
-			hooks = { callback }
-		end
-
-		local function disconnect()
-			local index = table.find(hooks :: { any }, callback)
-			if index then
-				table.remove(hooks :: { any }, index)
+			if IS_PAIR(id) then
+				local relation = world_pair_first(id)
+				local target = world_pair_first(id)
+				if not relation or not target then
+					return false
+				end
+				return check_is_component(relation, target)
+			else
+				return check_is_component(id)
 			end
 		end
-
-		return hooks, disconnect
 	end
 
-	local function world_added(id: u53, callback: SetHook)
-		local record = component_record_ensure(id)
-		local hooks, disconnect = insert_component_hook(callback, record.on_added)
-		record.on_added = hooks
-		return disconnect
-	end
-
-	local function world_changed(id: u53, callback: SetHook)
-		local record = component_record_ensure(id)
-		local hooks, disconnect = insert_component_hook(callback, record.on_changed)
-		record.on_changed = hooks
-		return disconnect
-	end
-
-	local function world_removed(id: u53, callback: RemovedHook)
-		local record = component_record_ensure(id)
-		local hooks, disconnect = insert_component_hook(callback, record.on_removed)
-		record.on_removed = hooks
-		return disconnect
+	local function world_is_tag(id: u53)
+		return not world_is_component(id)
 	end
 
 	local world_internal: WorldInternal = {
@@ -4095,15 +4407,85 @@ local function world_new()
 		bulk_set = world_bulk_set,
 		bulk_remove = world_bulk_remove,
 
-		added = world_added,
-		changed = world_changed,
-		removed = world_removed,
-
 		pair_first = world_pair_first,
 		pair_second = world_pair_second,
-		is_component = is_component,
-		is_tag = is_tag,
+		is_component = world_is_component,
+		is_tag = world_is_tag,
 	} :: any
+
+	local function world_added(id: u53, callback: SetHook)
+		local record = component_record_ensure(id)
+		local all_hooks = record.on_added :: Array<{ SetHook }>
+		if not all_hooks then
+			all_hooks = { {} } :: Array<{ SetHook }>
+			local is_pair = IS_PAIR(id)
+			if is_pair then
+				PROPAGATE_PAIR_EVENTS(world, id, record :: PairRecord, all_hooks, function(record)
+					return record.on_added
+				end, function(record, hooks)
+					record.on_added = hooks
+				end)
+			end
+		end
+
+		local hooks, disconnect = INSERT_COMPONENT_HOOK(callback, all_hooks[PAIR_HOOK_INDEX])
+		all_hooks[1] = hooks
+		record.on_added = all_hooks
+
+		return disconnect
+	end
+
+	local function world_changed(id: u53, callback: SetHook)
+		local record = component_record_ensure(id)
+		local all_hooks = record.on_changed :: Array<{ SetHook }>
+		if not all_hooks then
+			all_hooks = { {} } :: Array<{ SetHook }>
+			local is_pair = IS_PAIR(id)
+			if is_pair then
+				PROPAGATE_PAIR_EVENTS(world, id, record :: PairRecord, all_hooks, function(record)
+					return record.on_changed
+				end, function(record, hooks)
+					record.on_changed = hooks
+				end)
+			end
+		end
+
+		local hooks, disconnect = INSERT_COMPONENT_HOOK(callback, all_hooks[PAIR_HOOK_INDEX])
+		all_hooks[1] = hooks
+		record.on_changed = all_hooks
+
+		local is_pair = IS_PAIR(id)
+		if is_pair then
+		end
+
+		return disconnect
+	end
+
+	local function world_removed(id: u53, callback: RemovedHook)
+		local record = component_record_ensure(id)
+		local all_hooks = record.on_removed :: Array<{ RemovedHook }>
+		if not all_hooks then
+			all_hooks = { {} } :: Array<{ RemovedHook }>
+			local is_pair = IS_PAIR(id)
+			if is_pair then
+				PROPAGATE_PAIR_EVENTS(world, id, record :: PairRecord, all_hooks, function(record)
+					return record.on_removed
+				end, function(record, hooks)
+					record.on_removed = hooks
+				end)
+			end
+		end
+
+		local hooks, disconnect = INSERT_COMPONENT_HOOK(callback, all_hooks[PAIR_HOOK_INDEX])
+		all_hooks[1] = hooks
+		record.on_removed = all_hooks
+
+		local is_pair = IS_PAIR(id)
+		if is_pair then
+		end
+
+		return disconnect
+	end
 
 	local function world_query(...: u53)
 		local terms = { ... }
@@ -4111,12 +4493,42 @@ local function world_new()
 		return query_new(world, terms, with)
 	end
 
+	local function process_preregistered_hooks(
+		hooks: Map<u53, Array<{ hook: any, disconnect: Cleanup }>>,
+		world_hook: (...any) -> Cleanup
+	)
+		for id, hooks in hooks do
+			for _, hook_entry in hooks do
+				local hook = hook_entry.hook
+				local hook_disconnect = hook_entry.disconnect
+				local world_disconnect = world_hook(id, function(...)
+					hook(world, ...)
+				end)
+				hook_entry.disconnect = function()
+					hook_disconnect()
+					world_disconnect()
+				end
+			end
+		end
+	end
+
 	world.each = world_each :: any
 	world.query = world_query :: any
+	world.added = world_added :: any
+	world.changed = world_changed :: any
+	world.removed = world_removed :: any
 
-	for i = 1, ECS_REST do
+	for i = 1, preregistered_entities_count do
 		get_new_entity_id()
 	end
+
+	for id in preregistered_components do
+		world_add(id, ECS_COMPONENT)
+	end
+
+	process_preregistered_hooks(preregistered_hooks.added, world_added)
+	process_preregistered_hooks(preregistered_hooks.changed, world_changed)
+	process_preregistered_hooks(preregistered_hooks.removed, world_removed)
 
 	world_add(ECS_NAME, ECS_COMPONENT)
 	world_add(ECS_REST, ECS_COMPONENT)
@@ -4163,7 +4575,12 @@ return {
 
 	component = ANY(PREREGISTER_COMPONENT) :: () -> Component,
 	tag = ANY(PREREGISTER_TAG) :: () -> Entity,
+	entity = ANY(PREREGISTER_ENTITY) :: () -> Entity,
 	meta = ANY(PREREGISTER_METADATA) :: <T>(Entity, Component<T>, T?) -> (),
+
+	added = ANY(PREREGISTER_ADDED_HOOK) :: <T>(Component<T>, PreregisteredSetHook<T>) -> Cleanup,
+	changed = ANY(PREREGISTER_CHANGED_HOOK) :: <T>(Component<T>, PreregisteredSetHook<T>) -> Cleanup,
+	removed = ANY(PREREGISTER_REMOVED_HOOK) :: <T>(Component<T>, PreregisteredRemovedHook<T>) -> Cleanup,
 
 	ChildOf = ANY(ECS_CHILDOF) :: Entity,
 	Name = ANY(ECS_NAME) :: Component<string>,
@@ -4171,10 +4588,11 @@ return {
 	OnDelete = ANY(ECS_ON_DELETE) :: Entity,
 	OnDeleteTarget = ANY(ECS_ON_DELETE_TARGET) :: Entity,
 	Wildcard = ANY(ECS_WILDCARD) :: Entity,
-	Error = ANY(ECS_ERROR) :: Entity,
 	Delete = ANY(ECS_DELETE) :: Entity,
-	Traversable = ANY(ECS_TRAVERSABLE),
-	Disabled = ANY(),
+	PairIsTag = ANY(ECS_PAIR_IS_TAG) :: Entity,
+	Error = ANY(ECS_ERROR) :: Entity,
+	Traversable = ANY(ECS_TRAVERSABLE) :: Entity,
+	Disabled = ANY(ECS_DISABLED) :: Entity,
 
 	world = world_new,
 	World = {

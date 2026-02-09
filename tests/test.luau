@@ -1,5 +1,5 @@
 local testkit = require "./testkit"
-local ecs = require "../src/ecs"
+local ecs = require "../src/"
 
 local it = testkit.test()
 local TEST, CASE = it.TEST, it.CASE

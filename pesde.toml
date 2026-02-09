@@ -1,5 +1,5 @@
 name = "pepeeltoro41/pepecs"
-version = "0.0.3"
+version = "0.0.4"
 description = "Pepecs: an ecs"
 license = "MIT"
 authors = ["pepeeltoro41"]
