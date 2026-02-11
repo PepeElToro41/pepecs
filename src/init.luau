@@ -2758,10 +2758,6 @@ local function world_new()
 
 			archetype_count = 0,
 			flags = nil :: any,
-
-			monitors = {},
-			observers_added = {},
-			observers_changed = {},
 		}
 
 		if is_pair then
