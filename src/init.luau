@@ -142,7 +142,8 @@ type ReachableElement = {
 type ReachableCache = {
 	generation: number,
 	current: number,
-	ids: Map<u53, ReachableElement>,
+	cached: Map<u53, true>,
+	reachable: Map<u53, ReachableElement>,
 }
 
 export type PairRecord = ComponentRecord & {
@@ -2448,9 +2449,9 @@ local function query_patch(query: QueryInternal, mapper: (Entity: Entity, ...any
 	end
 end
 
-local function query_cached(query: QueryInternal)
+local function query_cached(query: QueryInternal): QueryInternal
 	if query.is_cached then
-		return
+		return query
 	end
 	query.is_cached = true
 	local with_ids = query.with_ids
@@ -2463,6 +2464,8 @@ local function query_cached(query: QueryInternal)
 	query.compatible_archetypes = compatible_archetypes
 	query.compatible_archetypes_map = compatible_archetypes_map
 	query.cache_cleanup = cleanup
+
+	return query
 end
 
 local function query_monitor(query: QueryInternal)
