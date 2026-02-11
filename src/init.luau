@@ -103,8 +103,6 @@ export type QueryInternal = Query<any> & {
 	world: World,
 	compatible_archetypes: Array<Archetype>,
 	compatible_archetypes_map: Map<ArchetypeId, number>,
-
-	match_archetype: (QueryInternal, Archetype) -> boolean,
 }
 
 export type Archetype = {
@@ -793,6 +791,23 @@ local function REMOVE_INSERTED_OBSERVERS<T>(inserted_in: { { T } }, observer: T)
 	end
 end
 
+local function MATCH_ARCHETYPE(with_ids: { number }, without_ids: { number }?, archetype: Archetype)
+	local columns_map = archetype.columns_map
+	for _, id in with_ids do
+		if not columns_map[id] then
+			return false
+		end
+	end
+	if without_ids then
+		for _, id in without_ids do
+			if columns_map[id] then
+				return false
+			end
+		end
+	end
+	return true
+end
+
 local function FIND_MATCHED_ARCHETYPES(
 	world: World,
 	with_ids: { number },
@@ -861,8 +876,8 @@ local function FIND_MATCHED_ARCHETYPES(
 			local columns_map = archetype.columns_map
 			local skip = false
 
-			for _, component in with_ids do
-				if not columns_map[component] then
+			for _, id in with_ids do
+				if not columns_map[id] then
 					skip = true
 					break
 				end
@@ -872,8 +887,8 @@ local function FIND_MATCHED_ARCHETYPES(
 			end
 
 			if without_ids then
-				for _, component in without_ids do
-					if columns_map[component] then
+				for _, id in without_ids do
+					if columns_map[id] then
 						skip = true
 						break
 					end
@@ -924,20 +939,7 @@ local function OBSERVE_MATCHED_ARCHETYPES(world: World, with_ids: { number }, wi
 	end
 
 	local function archetype_matcher(archetype: Archetype)
-		local columns_map = archetype.columns_map
-		for _, id in with_ids do
-			if not columns_map[id] then
-				return false
-			end
-		end
-		if without_ids then
-			for _, id in without_ids do
-				if columns_map[id] then
-					return false
-				end
-			end
-		end
-		return true
+		return MATCH_ARCHETYPE(with_ids, without_ids, archetype)
 	end
 
 	local creation_observer: ArchetypeObserver = {
@@ -953,20 +955,27 @@ local function OBSERVE_MATCHED_ARCHETYPES(world: World, with_ids: { number }, wi
 	if creation_observers then
 		table.insert(creation_observers, creation_observer)
 	else
-		archetype_creation_observers[observe_id] = { creation_observer }
+		creation_observers = { creation_observer }
+		archetype_creation_observers[observe_id] = creation_observers
 	end
 
 	local destruction_observers = archetype_destruction_observers[observe_id]
 	if destruction_observers then
 		table.insert(destruction_observers, destruction_observer)
 	else
-		archetype_destruction_observers[observe_id] = { destruction_observer }
+		destruction_observers = { destruction_observer }
+		archetype_destruction_observers[observe_id] = destruction_observers
 	end
 
 	local function cleanup()
 		local creation_index = table.find(creation_observers, creation_observer)
 		if creation_index then
 			table.remove(creation_observers, creation_index)
+		end
+
+		local destruction_index = table.find(destruction_observers, destruction_observer)
+		if destruction_index then
+			table.remove(destruction_observers, destruction_index)
 		end
 	end
 
@@ -1006,12 +1015,13 @@ local function observer_new(
 				local observers = { [PAIR_HOOK_INDEX] = query_observer }
 				local all_observers = { observers }
 				component_record.observers_added = all_observers
-
-				PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_observers, function(record)
-					return record.observers_added
-				end, function(record, set_observers)
-					record.observers_added = set_observers
-				end)
+				if IS_PAIR(id) then
+					PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_observers, function(record)
+						return record.observers_added
+					end, function(record, set_observers)
+						record.observers_added = set_observers
+					end)
+				end
 
 				table.insert(inserted_in, observers)
 			end
@@ -1035,11 +1045,13 @@ local function observer_new(
 			local all_observers = { observers }
 			component_record.observers_changed = all_observers
 
-			PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_observers, function(record)
-				return record.observers_changed
-			end, function(record, set_observers)
-				record.observers_changed = set_observers
-			end)
+			if IS_PAIR(id) then
+				PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_observers, function(record)
+					return record.observers_changed
+				end, function(record, set_observers)
+					record.observers_changed = set_observers
+				end)
+			end
 
 			table.insert(inserted_in, observers)
 		end
@@ -1093,11 +1105,13 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 				local all_monitors = { monitors }
 				component_record.monitors = all_monitors
 
-				PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_monitors, function(record)
-					return record.monitors
-				end, function(record, set_monitors)
-					record.monitors = set_monitors
-				end)
+				if IS_PAIR(id) then
+					PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_monitors, function(record)
+						return record.monitors
+					end, function(record, set_monitors)
+						record.monitors = set_monitors
+					end)
+				end
 
 				table.insert(inserted_in, monitors)
 			end
@@ -1199,7 +1213,7 @@ local function query_match(query: QueryInternal, archetype: Archetype)
 		local compatible_archetypes_map = query.compatible_archetypes_map
 		return compatible_archetypes_map[archetype.archetype_id] ~= nil
 	else
-		return query.match_archetype(query, archetype)
+		return MATCH_ARCHETYPE(query.with_ids, query.without_ids, archetype)
 	end
 end
 
@@ -2488,6 +2502,7 @@ query_mt.archetypes = query_archetypes
 
 query_mt.match = query_match
 query_mt.has = query_has
+query_mt.count = query_count
 query_mt.empty = query_empty
 query_mt.entities = query_entities
 query_mt.random = query_random
@@ -4358,7 +4373,7 @@ local function world_new()
 		entity_index = entity_index,
 
 		archetype_creation_observers = archetype_creation_observers,
-		archetype_destruction_observers = archetype_creation_observers,
+		archetype_destruction_observers = archetype_destruction_observers,
 
 		component_record_ensure = component_record_ensure,
 
@@ -4417,8 +4432,7 @@ local function world_new()
 		local all_hooks = record.on_added :: Array<{ SetHook }>
 		if not all_hooks then
 			all_hooks = { {} } :: Array<{ SetHook }>
-			local is_pair = IS_PAIR(id)
-			if is_pair then
+			if IS_PAIR(id) then
 				PROPAGATE_PAIR_EVENTS(world, id, record :: PairRecord, all_hooks, function(record)
 					return record.on_added
 				end, function(record, hooks)
@@ -4439,8 +4453,7 @@ local function world_new()
 		local all_hooks = record.on_changed :: Array<{ SetHook }>
 		if not all_hooks then
 			all_hooks = { {} } :: Array<{ SetHook }>
-			local is_pair = IS_PAIR(id)
-			if is_pair then
+			if IS_PAIR(id) then
 				PROPAGATE_PAIR_EVENTS(world, id, record :: PairRecord, all_hooks, function(record)
 					return record.on_changed
 				end, function(record, hooks)
@@ -4452,10 +4465,6 @@ local function world_new()
 		local hooks, disconnect = INSERT_COMPONENT_HOOK(callback, all_hooks[PAIR_HOOK_INDEX])
 		all_hooks[1] = hooks
 		record.on_changed = all_hooks
-
-		local is_pair = IS_PAIR(id)
-		if is_pair then
-		end
 
 		return disconnect
 	end
@@ -4478,10 +4487,6 @@ local function world_new()
 		local hooks, disconnect = INSERT_COMPONENT_HOOK(callback, all_hooks[PAIR_HOOK_INDEX])
 		all_hooks[1] = hooks
 		record.on_removed = all_hooks
-
-		local is_pair = IS_PAIR(id)
-		if is_pair then
-		end
 
 		return disconnect
 	end
