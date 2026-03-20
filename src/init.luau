@@ -32,7 +32,7 @@ export type ArchetypeMatch = (archetype: Archetype) -> boolean
 type ArchetypeObserverCallback = (archetype: Archetype) -> ()
 type ArchetypeObserver = { match: ArchetypeMatch, callback: ArchetypeObserverCallback }
 
-type QueryMonitorCallback = (entity: u53) -> ()
+type QueryMonitorCallback = (entity: u53, operation_id: number?) -> ()
 
 type QueryIdMonitor = {
 	match: ArchetypeMatch,
@@ -454,7 +454,7 @@ local function INSERT_COMPONENT_HOOK<T>(callback: T, hooks: { T }?): ({ T }, Cle
 		end
 	end
 
-	return hooks :: Array<{ T }>, disconnect
+	return hooks :: { T }, disconnect
 end
 
 local function PREREGISTER_COMPONENT()
@@ -655,128 +655,134 @@ local function PROPAGATE_PAIR_EVENTS<T>(
 	end
 end
 
-local function FIRE_MONITOR(monitor: QueryIdMonitor, entity: u53, source: Archetype, destination: Archetype)
-	local match = monitor.match
-	local matched_before = match(source)
-	local matched_after = match(destination)
-
-	if matched_before ~= matched_after then
-		if matched_before then
-			local removed = monitor.removed
-			if removed then
-				removed(entity)
-			end
-		else
-			local added = monitor.added
-			if added then
-				added(entity)
-			end
-		end
-	end
-end
-
-local function FIRE_MONITOR_ENTITIES(
-	monitor: QueryIdMonitor,
+local function FIRE_MONITORS_ENTITIES(
+	all_monitors: Array<{ QueryIdMonitor }>,
 	entities: { u53 },
 	source: Archetype,
-	destination: Archetype
-)
-	local match = monitor.match
-	local matched_before = match(source)
-	local matched_after = match(destination)
-
-	if matched_before ~= matched_after then
-		if matched_before then
-			local removed = monitor.removed
-			if removed then
-				for _, entity in entities do
-					removed(entity)
-				end
-			end
-		else
-			local added = monitor.added
-			if added then
-				for _, entity in entities do
-					added(entity)
-				end
-			end
-		end
-	end
-end
-
-local function FIRE_QUERY_MONITORS(
-	all_monitors: Array<{ QueryIdMonitor }>,
-	entity: u53,
-	source: Archetype,
-	destination: Archetype
+	destination: Archetype,
+	operation_id: number?
 )
 	for _, monitors in all_monitors do
 		for _, monitor in monitors do
-			FIRE_MONITOR(monitor, entity, source, destination)
+			local match = monitor.match
+			local matched_before = match(source)
+			local matched_after = match(destination)
+
+			if matched_before ~= matched_after then
+				if matched_before then
+					local removed = monitor.removed
+					if removed then
+						for _, entity in entities do
+							removed(entity)
+						end
+					end
+				else
+					local added = monitor.added
+					if added then
+						for _, entity in entities do
+							added(entity)
+						end
+					end
+				end
+			end
 		end
 	end
 end
 
-local function FIRE_QUERY_OBSERVERS(all_observers: Array<{ QueryIdObserver }>, entity: u53, archetype: Archetype)
+local function FIRE_OBSERVERS_ENTITIES(
+	all_observers: Array<{ QueryIdObserver }>,
+	entities: { u53 },
+	archetype: Archetype,
+	operation_id: number?
+)
 	for _, observers in all_observers do
 		for _, observer in observers do
+			local callback = observer.callback
 			if observer.match(archetype) then
-				observer.callback(entity)
+				for _, entity in entities do
+					callback(entity, operation_id)
+				end
 			end
 		end
 	end
 end
 
-local function FIRE_QUERY_OBSERVERS_SET(observers_set: Map<QueryIdObserver, true>, entity: u53, archetype: Archetype)
-	for observer in observers_set do
-		if observer.match(archetype) then
-			observer.callback(entity)
-		end
-	end
-end
-
--- monitors/observers will be accumulated in a hashmap set for code that changes multiple components at once
--- to prevent them from firing multiple times as a single monitor subscribes to multiple components at the same time.
--- multiple monitors that belong to the same query are ovewritten and fired once per query
--- its slower but keeps monitors reliable
-
--- TODO: find another solution, monitors/observers could check if the destination and entity repeats.
--- Or an operation id could be generated and passed, to check if the operation is the same
-local function ACCUMULATE_MONITORS_SET(
-	component_record: ComponentRecord,
-	monitors_set: Map<QueryIdMonitor, true>?,
-	observers_added_set: Map<QueryIdObserver, true>?,
-	observers_changed_set: Map<QueryIdObserver, true>?
+local function FIRE_MONITORS(
+	all_monitors: Array<{ QueryIdMonitor }>,
+	entity: u53,
+	source: Archetype,
+	destination: Archetype,
+	operation_id: number?
 )
-	if monitors_set then
-		local all_monitors = component_record.monitors
-		if all_monitors then
-			for _, monitors in all_monitors do
-				for _, monitor in monitors do
-					monitors_set[monitor] = true
+	for _, monitors in all_monitors do
+		for _, monitor in monitors do
+			local match = monitor.match
+			local matched_before = match(source)
+			local matched_after = match(destination)
+
+			if matched_before ~= matched_after then
+				if matched_before then
+					local removed = monitor.removed
+					if removed then
+						removed(entity, operation_id)
+					end
+				else
+					local added = monitor.added
+					if added then
+						added(entity, operation_id)
+					end
 				end
 			end
 		end
 	end
+end
 
-	if observers_added_set then
-		local all_observers = component_record.observers_added
-		if all_observers then
-			for _, observers in all_observers do
-				for _, observer in observers do
-					observers_added_set[observer] = true
+local function FIRE_MONITORS_ADDED(
+	all_monitors: Array<{ QueryIdMonitor }>,
+	entity: u53,
+	destination: Archetype,
+	operation_id: number?
+)
+	for _, monitors in all_monitors do
+		for _, monitor in monitors do
+			local added = monitor.added
+			if added then
+				if monitor.match(destination) then
+					added(entity, operation_id)
 				end
 			end
 		end
 	end
+end
 
-	if observers_changed_set then
-		local all_observers = component_record.observers_changed
-		if all_observers then
-			for _, observers in all_observers do
-				for _, observer in observers do
-					observers_changed_set[observer] = true
+local function FIRE_MONITORS_REMOVED(
+	all_monitors: Array<{ QueryIdMonitor }>,
+	entity: u53,
+	source: Archetype,
+	operation_id: number?
+)
+	for _, monitors in all_monitors do
+		for _, monitor in monitors do
+			local removed = monitor.removed
+			if removed then
+				if monitor.match(source) then
+					removed(entity)
 				end
+			end
+		end
+	end
+end
+
+local function FIRE_OBSERVERS(
+	all_observers: Array<{ QueryIdObserver }>,
+	entity: u53,
+	destination: Archetype,
+	operation_id: number?
+)
+	for _, observers in all_observers do
+		for _, observer in observers do
+			if observer.match(destination) then
+				observer.callback(entity, operation_id)
 			end
 		end
 	end
@@ -808,6 +814,7 @@ local function MATCH_ARCHETYPE(with_ids: { number }, without_ids: { number }?, a
 	return true
 end
 
+-- TODO: make faster archetype matching with bitsets
 local function FIND_MATCHED_ARCHETYPES(
 	world: World,
 	with_ids: { number },
@@ -982,23 +989,35 @@ local function OBSERVE_MATCHED_ARCHETYPES(world: World, with_ids: { number }, wi
 	return compatible_archetypes, compatible_archetypes_map, cleanup
 end
 
+-- TODO: make archetype caching optional
 local function observer_new(
 	world: World,
 	terms: { u53 },
 	with_ids: { u53 },
 	without_ids: { u53 }?,
-	callback: QueryMonitorCallback
+	callback: (entity: u53) -> ()
 )
 	local component_record_ensure = world.internal.component_record_ensure
 	local _, archetypes_map, observers_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids)
+	local last_operation_id: number? = nil
 
 	local function query_match(archetype: Archetype)
 		return archetypes_map[archetype.archetype_id] ~= nil
 	end
 
+	local function match_callback(entity: u53, operation_id: number?)
+		if operation_id then
+			if operation_id == last_operation_id then
+				return
+			end
+		end
+		last_operation_id = operation_id
+		callback(entity)
+	end
+
 	local query_observer: QueryIdObserver = {
 		match = query_match,
-		callback = callback,
+		callback = match_callback,
 	}
 
 	local inserted_in: { { QueryIdObserver } } = {}
@@ -1063,9 +1082,11 @@ local function observer_new(
 	end
 end
 
+-- TODO: make archetype caching optional
 local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }?)
 	local component_record_ensure = world.internal.component_record_ensure
 	local _, archetypes_map, cache_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids)
+	local last_operation_id: number? = nil
 
 	local function query_match(archetype: Archetype)
 		return archetypes_map[archetype.archetype_id] ~= nil
@@ -1080,11 +1101,29 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 	local inserted_in: { { QueryIdMonitor } } = {}
 
 	local function monitor_added(callback: QueryMonitorCallback)
-		query_monitor.added = callback
+		query_monitor.added = function(entity, operation_id)
+			if operation_id then
+				if operation_id == last_operation_id then
+					return
+				end
+			end
+			last_operation_id = operation_id
+
+			callback(entity)
+		end
 	end
 
 	local function monitor_removed(callback: QueryMonitorCallback)
-		query_monitor.removed = callback
+		query_monitor.removed = function(entity, operation_id)
+			if operation_id then
+				if operation_id == last_operation_id then
+					return
+				end
+			end
+			last_operation_id = operation_id
+
+			callback(entity)
+		end
 	end
 
 	local function cleanup()
@@ -2486,7 +2525,7 @@ local function query_monitor(query: QueryInternal)
 	return monitor_new(query.world, query.with_ids, query.without_ids)
 end
 
-local function query_observe(query: QueryInternal, callback: QueryMonitorCallback)
+local function query_observe(query: QueryInternal, callback: (entity: u53) -> ())
 	return observer_new(query.world, query.terms, query.with_ids, query.without_ids, callback)
 end
 
@@ -2494,6 +2533,353 @@ local function query_changed(query: QueryInternal)
 	return query_changed_new(query.world, query.terms, query.with_ids, query.without_ids)
 end
 
+export type QueryEngine<T...> = {}
+
+type ArchetypeMatcher = {
+	with_ids: Array<u53>,
+	without_ids: Array<u53>,
+}
+
+export type QueryEngineInternal = QueryEngine<any> & {
+	world: World,
+	invalidated: boolean,
+	descriptor: QueryDescriptor,
+	compiled: boolean,
+
+	base_matcher: ArchetypeMatcher,
+
+	trivial_outputs: Array<u53 | false>,
+	match_program: ProgramPreprocess,
+	outer_program: ProgramPreprocess,
+	inner_program: ProgramPreprocess,
+
+	valid_archetypes: Array<Archetype>,
+	invalid_archetypes: Array<Archetype>,
+}
+
+export type QueryBuilder = {
+	term: (self: QueryBuilder, component: Entity) -> QueryBuilder,
+	with: (self: QueryBuilder, component: Entity) -> QueryBuilder,
+	without: (self: QueryBuilder, component: Entity) -> QueryBuilder,
+
+	transitive: (self: QueryBuilder) -> QueryBuilder,
+	optional: (self: QueryBuilder) -> QueryBuilder,
+	bor: (self: QueryBuilder) -> QueryBuilder,
+	wildcard: (self: QueryBuilder) -> QueryBuilder,
+	target: (self: QueryBuilder, target: Entity | string) -> QueryBuilder,
+	from: (self: QueryBuilder, source: Entity | string) -> QueryBuilder,
+
+	up: (self: QueryBuilder, relation: Entity, var: string?) -> QueryBuilder,
+	self: (self: QueryBuilder) -> (),
+
+	build: (self: QueryBuilder) -> QueryEngine<...any>,
+}
+
+type ProgramPreprocess = {
+	instructions: { InstructionEntry },
+}
+type InstructionEntry = {
+	disabled: boolean,
+	instruction: Instruction,
+}
+
+type Instruction = { any }
+type Bytecode = { Instruction }
+type OPCode = number
+
+type Term = {
+	term_output: number?,
+	optional: boolean,
+	ored: Term?,
+	negated: boolean,
+	transitive: boolean,
+
+	id: u53,
+	self: boolean,
+	source: string?,
+	target: (u53 | string)?,
+	traversal: u53?,
+	traversal_var: string?,
+}
+
+export type QueryDescriptor = {
+	total_outputs: number,
+	terms: { Term },
+}
+
+local OP_JMP_TAG = 0
+local OP_MATCH_ARCH = 1
+local OP_OUT_TERM = 2
+local OP_CLR_TERM = 3
+local OP_PUSH_VAR_REL = 5
+local OP_PUSH_TARGET_ARCH = 5
+local OP_TRAV_OUT = 7
+local OP_TRAV_SELF_OUT = 7
+local OP_TRAV_ID = 6
+local OP_TRAV_SELF_ID = 7
+local OP_MATCH_ID = 7
+local OP_JMP = 8
+local OP_JMP_TRUE = 9
+local OP_JMP_FALSE = 10
+local OP_EMIT = 11
+local OP_EXIT = 12
+
+local query_engine_mt = {}
+
+local function create_program(): ProgramPreprocess
+	return {
+		instructions = {},
+	}
+end
+local function term_is_required(term: Term)
+	local skip = term.negated or term.optional or term.ored
+	return not skip
+end
+local function term_is_excluded(term: Term)
+	local skip = term.optional or term.ored
+	return term.negated and not skip
+end
+
+local function OP_CODE(program: ProgramPreprocess, op: OPCode, ...)
+	table.insert(program.instructions, {
+		disabled = false,
+		instruction = { op, ... },
+	})
+end
+
+--[[
+	UP
+	JUMPTRUE skip
+	TRAV
+	JUMPTRUE skip
+	EXIT
+	:skip
+
+]]
+
+-- TODO:
+-- transitive should accept query vars
+-- transitive should output variables
+-- traversable should output variables
+-- traversable ids should accept query vars
+-- non-compiled queries should not initialize programs
+-- add "maybe" trivial outputs
+-- transitive/traversal should accept optional
+
+local function query_engine_rematch(query: QueryEngineInternal) end
+
+local function query_engine_compile(query: QueryEngineInternal)
+	local descriptor = query.descriptor
+	local with_ids = query.base_matcher.with_ids
+	local without_ids = query.base_matcher.without_ids
+
+	local trivial_outputs = query.trivial_outputs
+	local match_program = query.match_program
+	local outer_program = query.outer_program
+	local inner_program = query.inner_program
+
+	local query_variables: Map<string, {
+		terms: { Term },
+		var_index: number,
+		matcher: ArchetypeMatcher,
+	}> = {}
+
+	local block_jump_index = 0
+	local current_var_index = 0
+	local ored: Term? = nil
+	local compile_term: (term: Term) -> ()
+
+	local function term_is_required(term: Term)
+		if ored then
+			return false
+		end
+		local skip = term.negated or term.optional or term.ored
+		return not skip
+	end
+
+	local function term_is_excluded(term: Term)
+		if ored then
+			return false
+		end
+		local skip = term.ored or term.optional
+		return term.negated and not skip
+	end
+
+	local function compile_ored(ored_term: Term)
+		local current_ored = ored
+		ored = ored_term
+		compile_term(ored_term)
+		ored = current_ored
+	end
+
+	local function block_start(term: Term)
+		if not ored then
+			block_jump_index += 1
+		end
+		if term.negated then
+			OP_CODE(match_program, OP_JMP_FALSE, `skip{block_jump_index}`)
+		else
+			OP_CODE(match_program, OP_JMP_TRUE, `skip{block_jump_index}`)
+		end
+	end
+
+	local function block_end()
+		if ored then
+			return
+		end
+		OP_CODE(match_program, OP_EXIT)
+		OP_CODE(match_program, OP_JMP_TAG, `skip{block_jump_index}`)
+	end
+
+	local function compile_block(term: Term)
+		block_start(term)
+		local ored_term = term.ored
+		if ored_term then
+			compile_ored(ored_term)
+		end
+		block_end()
+	end
+
+	local function get_query_var(var_name: string)
+		local variable = query_variables[var_name]
+		if not variable then
+			current_var_index += 1
+			local matcher = { with_ids = {} } :: ArchetypeMatcher
+			local new_variable = {
+				terms = {},
+				var_index = current_var_index,
+				matcher = matcher,
+			}
+			query_variables[var_name] = new_variable
+			return new_variable
+		end
+		return variable
+	end
+
+	local function compile_traversal(term: Term, relation: u53, id: u53)
+		if term_is_required(term) and not term.self then
+			local wildcard = ECS_PAIR(relation, ECS_WILDCARD)
+			table.insert(with_ids, wildcard)
+		end
+
+		if term.target then
+			if typeof(term.target) == "number" then
+				id = ECS_PAIR(id, term.target)
+			else
+				error "query variables are not supported in transitive/traversal terms"
+			end
+		end
+
+		local op_code = term.self and OP_TRAV_SELF_ID or OP_TRAV_ID
+		OP_CODE(match_program, op_code, term.traversal, term.id)
+		compile_block(term)
+
+		if term.term_output then
+			local out_op_code = term.self and OP_TRAV_SELF_OUT or OP_TRAV_OUT
+			OP_CODE(outer_program, out_op_code, term.term_output, relation, term.id)
+		end
+	end
+
+	function compile_term(term: Term)
+		if term.transitive then
+			local rel = term.id
+			if not term.target then
+				rel = PAIR_FIRST(term.id)
+			end
+
+			compile_traversal(term, rel, term.id)
+		elseif term.traversal then
+			compile_traversal(term, term.traversal, term.id)
+		elseif term.target then
+			local second = term.target
+			if type(second) == "number" then
+				local pair = ECS_PAIR(term.id, second)
+				if term_is_required(term) then
+					table.insert(with_ids, pair)
+					if term.term_output then
+						trivial_outputs[term.term_output] = term.id
+					end
+				elseif term_is_excluded(term) then
+					table.insert(without_ids, pair)
+				else
+					-- TODO: check for optionals
+					OP_CODE(match_program, OP_MATCH_ID, pair)
+					compile_block(term)
+				end
+			else
+				if not term_is_required(term) then
+					error "query variables cannot be negated/or'ed/optional"
+				end
+
+				local variable = get_query_var(second)
+				local wildcard = ECS_PAIR(PAIR_FIRST(term.id), ECS_WILDCARD)
+				table.insert(with_ids, wildcard)
+				table.insert(variable.terms, term)
+			end
+		else
+			if term.source then
+				if term_is_required(term) then
+					table.insert(with_ids, term.id)
+				elseif term_is_excluded(term) then
+					table.insert(without_ids, term.id)
+				else
+					-- TODO: check for optionals
+					-- TODO: add query vars
+					OP_CODE(match_program, OP_MATCH_ID, term.id)
+					compile_block(term)
+				end
+			else
+				if term_is_required(term) then
+					table.insert(with_ids, term.id)
+				elseif term_is_excluded(term) then
+					table.insert(without_ids, term.id)
+				else
+					-- TODO: check for optionals
+					-- TODO: add query vars
+					OP_CODE(match_program, OP_MATCH_ID, term.id)
+					compile_block(term)
+				end
+			end
+		end
+	end
+
+	for _, term in descriptor.terms do
+		compile_term(term)
+	end
+
+	query.compiled = true
+	query.invalidated = true
+	return query
+end
+
+local function query_engine_new(world: World, descriptor: QueryDescriptor)
+	local query = {} :: QueryEngineInternal
+
+	query.world = world
+	query.descriptor = descriptor
+	query.compiled = false
+	query.invalidated = true
+	query.trivial_outputs = table.create(query.descriptor.total_outputs, false) :: {}
+
+	query.match_program = create_program()
+	query.outer_program = create_program()
+	query.inner_program = create_program()
+
+	query.base_matcher = {
+		with_ids = {},
+		without_ids = {},
+	}
+
+	query.valid_archetypes = {}
+	query.invalid_archetypes = {}
+	return query
+end
+
+local function query_build()
+	local builder = {} :: QueryBuilder
+
+	return builder
+end
 query_mt.with = query_with
 query_mt.without = query_without
 query_mt.clone = query_clone
@@ -2523,6 +2909,7 @@ local function world_new()
 	local dense_arr = {}
 	local sparse_arr = {}
 
+	local current_operation_id = 0
 	local archetypes_count = 1
 	local archetypes: Map<ArchetypeId, Archetype> = {}
 	local archetypes_lookup: Map<string, Archetype> = {}
@@ -2631,20 +3018,37 @@ local function world_new()
 	end
 
 	local function delete_entity_id(id: u24, record: EntityRecord)
-		local alive = entity_index.alive
+		local old_alive = entity_index.alive
 
 		local dense_index = record.dense
-		if dense_index ~= alive then
-			local swap = dense_arr[alive]
-			dense_arr[dense_index] = swap
+		if dense_index ~= old_alive then
+			local swap_id = dense_arr[old_alive]
+			dense_arr[dense_index] = swap_id
 
-			local swap_record = sparse_arr[swap]
+			local swap_record = sparse_arr[ENTITY_ID(swap_id)]
 			swap_record.dense = dense_index
 		end
-		local new_generation = INCREMENT_GENERATION(dense_arr[dense_index])
-		dense_arr[alive] = new_generation
-		record.dense = alive
+		local new_generation = INCREMENT_GENERATION(id)
+		dense_arr[old_alive] = new_generation
+		record.dense = old_alive
+
 		entity_index.alive -= 1
+	end
+
+	local function reachable_invalidate_down(relation: u53, id: u53, record: PairRecord)
+		record.reachable.generation += 1
+
+		for archetype_id in record.column_index do
+			local archetype = archetypes[archetype_id]
+
+			for _, entity in archetype.entities do
+				local child_id = ECS_PAIR(relation, entity :: any)
+				local child_record = components_lookup[child_id] :: PairRecord
+				if child_record then
+					reachable_invalidate_down(relation, child_id, child_record)
+				end
+			end
+		end
 	end
 
 	local function fetch(columns: { [u53]: Column }, id: u53, row: number)
@@ -3140,6 +3544,8 @@ local function world_new()
 		local columns = table.create(columns_length) :: { Column }
 
 		local columns_map: Map<u53, Column> = {}
+		local traversable_ids = {}
+		local traversable_count = 0
 
 		local archetype: Archetype = {
 			archetype_id = archetype_id,
@@ -3155,7 +3561,7 @@ local function world_new()
 			backwards_edges = {},
 
 			traversable_count = 0,
-			traversable_ids = {},
+			traversable_ids = traversable_ids,
 		}
 
 		for index, id in ids do
@@ -3176,8 +3582,8 @@ local function world_new()
 				relation_record.archetype_count += 1
 
 				if CHECK_FLAG(relation_record.flags, IS_TRAVERSABLE_FLAG) then
-					archetype.traversable_count += 1
-					table.insert(archetype.traversable_ids, id)
+					traversable_count += 1
+					table.insert(traversable_ids, id)
 				end
 
 				local relation_appended = archetype_append_to_pair(relation_record, archetype_id, index)
@@ -3194,7 +3600,7 @@ local function world_new()
 				end
 			end
 		end
-
+		archetype.traversable_count = traversable_count
 		archetypes[archetype_id] = archetype
 		archetypes_lookup[hash] = archetype
 
@@ -3319,7 +3725,9 @@ local function world_new()
 			for index, destination_column in destination_columns do
 				local id = destination_components[index]
 				local column = columns_map[id]
-				table.move(column, 1, source_last_row, destination_last_row + 1, destination_column)
+				if column ~= NULL_ARRAY then
+					table.move(column, 1, source_last_row, destination_last_row + 1, destination_column)
+				end
 			end
 
 			if destination_last_row == 0 then
@@ -3361,7 +3769,7 @@ local function world_new()
 
 			local observers = component_record.observers_changed
 			if observers then
-				FIRE_QUERY_OBSERVERS(observers, entity, source)
+				FIRE_OBSERVERS(observers, entity, source)
 			end
 
 			local changed_hooks = component_record.on_changed
@@ -3412,12 +3820,12 @@ local function world_new()
 			if swapped_record then
 				local swap_monitors = swapped_record.monitors
 				if swap_monitors then
-					FIRE_QUERY_MONITORS(swap_monitors, entity, source, destination)
+					FIRE_MONITORS(swap_monitors, entity, source, destination)
 				end
 
 				local swap_observers = swapped_record.observers_added
 				if swap_observers then
-					FIRE_QUERY_OBSERVERS(swap_observers, entity, destination)
+					FIRE_OBSERVERS(swap_observers, entity, destination)
 				end
 			end
 
@@ -3425,12 +3833,12 @@ local function world_new()
 			if component_record then
 				local monitors = component_record.monitors
 				if monitors then
-					FIRE_QUERY_MONITORS(monitors, entity, source, destination)
+					FIRE_MONITORS(monitors, entity, source, destination)
 				end
 
 				local observers = component_record.observers_added
 				if observers then
-					FIRE_QUERY_OBSERVERS(observers, entity, destination)
+					FIRE_OBSERVERS(observers, entity, destination)
 				end
 
 				local added_hooks = component_record.on_added
@@ -3495,15 +3903,25 @@ local function world_new()
 			archetype_move_entity(entity, record, source, destination)
 		end
 
+		--[[
+		local target_wildcard = ECS_PAIR(ECS_WILDCARD, entity)
+		local target_record = components_lookup[target_wildcard] :: PairRecord
+		if target_record then
+			for id, record in target_record.trav_records do
+				reachable_invalidate_down(PAIR_FIRST(id), id, record)
+			end
+		end
+		]]
+
 		if swapped_record then
 			local swap_monitors = swapped_record.monitors
 			if swap_monitors then
-				FIRE_QUERY_MONITORS(swap_monitors, entity, source, destination)
+				FIRE_MONITORS(swap_monitors, entity, source, destination)
 			end
 
 			local swap_observers = swapped_record.observers_added
 			if swap_observers then
-				FIRE_QUERY_OBSERVERS(swap_observers, entity, destination)
+				FIRE_OBSERVERS(swap_observers, entity, destination)
 			end
 		end
 
@@ -3511,12 +3929,12 @@ local function world_new()
 		if component_record then
 			local monitors = component_record.monitors
 			if monitors then
-				FIRE_QUERY_MONITORS(monitors, entity, source, destination)
+				FIRE_MONITORS(monitors, entity, source, destination)
 			end
 
 			local observers = component_record.observers_added
 			if observers then
-				FIRE_QUERY_OBSERVERS(observers, entity, destination)
+				FIRE_OBSERVERS(observers, entity, destination)
 			end
 
 			local added_hooks = component_record.on_added
@@ -3552,12 +3970,12 @@ local function world_new()
 
 		local monitors = component_record.monitors
 		if monitors then
-			FIRE_QUERY_MONITORS(monitors, entity, source, destination)
+			FIRE_MONITORS(monitors, entity, source, destination)
 		end
 
 		local observers = component_record.observers_added
 		if observers then
-			FIRE_QUERY_OBSERVERS(observers, entity, destination)
+			FIRE_OBSERVERS(observers, entity, destination)
 		end
 
 		-- important that post-removed callbacks are called after monitors
@@ -3573,50 +3991,40 @@ local function world_new()
 	local function archetype_move_entities_to(
 		archetype: Archetype,
 		entities: { u53 },
-		affected: Map<u53, ComponentRecord>,
+		affected_removals: Map<u53, ComponentRecord>,
 		destination: Archetype
 	)
-		local post_removed_callbacks: Array<{ () -> () }>
-		local monitors_set: Map<QueryIdMonitor, true> = {}
-		local observers_added_set: Map<QueryIdObserver, true> = {}
+		local post_removed_callbacks: { () -> () }? = nil
 
-		for id, component_record in affected do
-			ACCUMULATE_MONITORS_SET(component_record, monitors_set, observers_added_set)
+		local operation_id = current_operation_id + 1
+		current_operation_id = operation_id
 
+		for id, component_record in affected_removals do
 			local removed_hooks = component_record.on_removed
 			if removed_hooks then
 				for row, entity in entities do
-					local post_removed = FIRE_REMOVE_HOOKS(removed_hooks, entity, id)
-					if post_removed then
-						if post_removed_callbacks then
-							table.insert(post_removed_callbacks, post_removed)
-						else
-							post_removed_callbacks = { post_removed }
-						end
-					end
+					post_removed_callbacks = FIRE_REMOVE_HOOKS(removed_hooks, entity, id, post_removed_callbacks)
 				end
 			end
 		end
 
 		archetype_bulk_move_entities(archetype, destination, entities)
 
-		for monitor in monitors_set do
-			FIRE_MONITOR_ENTITIES(monitor, entities, archetype, destination)
-		end
+		for id, component_record in affected_removals do
+			local all_monitors = component_record.monitors
+			if all_monitors then
+				FIRE_MONITORS_ENTITIES(all_monitors, entities, archetype, destination)
+			end
 
-		for observer in observers_added_set do
-			if observer.match(destination) then
-				for _, entity in entities do
-					observer.callback(entity)
-				end
+			local all_observers = component_record.observers_added
+			if all_observers then
+				FIRE_OBSERVERS_ENTITIES(all_observers, entities, destination)
 			end
 		end
 
 		if post_removed_callbacks then
-			for _, post_removed in post_removed_callbacks do
-				for _, callback in post_removed do
-					callback()
-				end
+			for _, callback in post_removed_callbacks do
+				callback()
 			end
 		end
 	end
@@ -3642,11 +4050,7 @@ local function world_new()
 		archetype_bulk_move_entities(archetype, destination, entities)
 
 		if all_monitors then
-			for _, monitors in all_monitors do
-				for _, monitor in monitors do
-					FIRE_MONITOR_ENTITIES(monitor, entities, archetype, destination)
-				end
-			end
+			FIRE_MONITORS_ENTITIES(all_monitors, entities, archetype, destination)
 		end
 
 		if all_observers then
@@ -3697,11 +4101,12 @@ local function world_new()
 	local function clear_entity_components(entity: u53, record: EntityRecord)
 		local archetype = record.archetype
 		local post_removed_callbacks: { () -> () }?
-		local monitors_set: Map<QueryIdMonitor, true> = {}
+
+		local operation_id = current_operation_id + 1
+		current_operation_id = operation_id
 
 		for _, id in archetype.components do
 			local component_record = components_lookup[id]
-			ACCUMULATE_MONITORS_SET(component_record, monitors_set)
 
 			local removed_hooks = component_record.on_removed
 			if removed_hooks then
@@ -3713,12 +4118,12 @@ local function world_new()
 		record.archetype = ROOT_ARCHETYPE
 		record.archetype_row = -1
 
-		for monitor in monitors_set do
-			local removed = monitor.removed
-			if removed then
-				if monitor.match(archetype) then
-					removed(entity)
-				end
+		for _, id in archetype.components do
+			local component_record = components_lookup[id]
+			local all_monitors = component_record.monitors
+
+			if all_monitors then
+				FIRE_MONITORS_REMOVED(all_monitors, entity, archetype, operation_id)
 			end
 		end
 
@@ -3737,6 +4142,7 @@ local function world_new()
 		if record.deleting then
 			error "attempted to destroy an entity twice"
 		end
+		record.deleting = true
 
 		local component_record = components_lookup[entity]
 		local relation_record = components_lookup[ECS_PAIR(entity, ECS_WILDCARD)] :: PairRecord
@@ -3920,6 +4326,10 @@ local function world_new()
 		if not record then
 			return
 		end
+
+		local operation_id = current_operation_id + 1
+		current_operation_id = operation_id
+
 		local source = record.archetype
 
 		if source == ROOT_ARCHETYPE then
@@ -3929,43 +4339,29 @@ local function world_new()
 			local destination = archetype_ensure(destination_ids)
 			archetype_assign_entity(entity, record, destination)
 
-			-- notifying
-			local monitors_set: Map<QueryIdMonitor, true> = {}
-			local observers_added_set: Map<QueryIdObserver, true> = {}
-			local firing_hooks: Map<number, Array<{ SetHook }>> = {}
-
-			-- hooks are added in an array to keep the same order things are fired
-			-- monitors/observers sets are fired before changed hooks
-			-- so this means monitor sets should be fully accumulated before firing added hooks
 			for index, id in ids do
 				local component_record = components_lookup[id]
-				ACCUMULATE_MONITORS_SET(component_record, monitors_set, observers_added_set)
+				local all_monitors = component_record.monitors
+				if all_monitors then
+					-- small optimization in root archetype, as no queries are currently matching
+					-- so we fire all monitors that match as "added" without checking the old archetype
+					FIRE_MONITORS_ADDED(all_monitors, entity, destination, operation_id)
+				end
+
+				local all_observers = component_record.observers_added
+				if all_observers then
+					FIRE_OBSERVERS(all_observers, entity, destination, operation_id)
+				end
+
 				local on_added = component_record.on_added
 				if on_added then
-					firing_hooks[index] = on_added
+					FIRE_SET_HOOKS(on_added, entity, id, nil)
 				end
-			end
-
-			for monitor in monitors_set do
-				local added = monitor.added
-				if added then
-					local matched = monitor.match(destination)
-					if matched then
-						added(entity)
-					end
-				end
-			end
-
-			FIRE_QUERY_OBSERVERS_SET(observers_added_set, entity, destination)
-
-			for index, hooks in firing_hooks do
-				FIRE_SET_HOOKS(hooks, entity, ids[index], nil)
 			end
 		else
 			local destination_ids = table.clone(source.components)
 			local inserted: Array<number> = {}
 
-			-- inserting ids
 			for index, id in ids do
 				local at = FIND_INSERT(destination_ids, id)
 				if at ~= -1 then
@@ -3976,32 +4372,27 @@ local function world_new()
 
 			local destination = archetype_ensure(destination_ids)
 
-			-- notifying
 			if destination ~= source then
 				archetype_move_entity(entity, record, source, destination)
-
-				local monitors_set: Map<QueryIdMonitor, true> = {}
-				local observers_added_set: Map<QueryIdObserver, true> = {}
-				local firing_hooks: Map<number, Array<{ SetHook }>> = {}
 
 				for _, index in inserted do
 					local id = ids[index]
 					local component_record = components_lookup[id]
-					ACCUMULATE_MONITORS_SET(component_record, monitors_set, observers_added_set)
+
+					local all_monitors = component_record.monitors
+					if all_monitors then
+						FIRE_MONITORS(all_monitors, entity, source, destination, operation_id)
+					end
+
+					local all_observers = component_record.observers_added
+					if all_observers then
+						FIRE_OBSERVERS(all_observers, entity, destination, operation_id)
+					end
+
 					local on_added = component_record.on_added
 					if on_added then
-						firing_hooks[index] = on_added
+						FIRE_SET_HOOKS(on_added, entity, id, nil)
 					end
-				end
-
-				for monitor in monitors_set do
-					FIRE_MONITOR(monitor, entity, source, destination)
-				end
-
-				FIRE_QUERY_OBSERVERS_SET(observers_added_set, entity, destination)
-
-				for index, hooks in firing_hooks do
-					FIRE_SET_HOOKS(hooks, entity, ids[index], nil)
 				end
 			end
 		end
@@ -4012,6 +4403,10 @@ local function world_new()
 		if not record then
 			return
 		end
+
+		local operation_id = current_operation_id + 1
+		current_operation_id = operation_id
+
 		local source = record.archetype
 
 		if source == ROOT_ARCHETYPE then
@@ -4022,40 +4417,29 @@ local function world_new()
 			archetype_assign_entity(entity, record, destination)
 			archetype_bulk_modify_columns(record.archetype_row, destination, ids, values)
 
-			-- notifying
-			local monitors_set: Map<QueryIdMonitor, true> = {}
-			local observers_added_set: Map<QueryIdObserver, true> = {}
-			local firing_hooks: Map<number, Array<{ SetHook }>> = {}
-
 			for index, id in ids do
 				local component_record = components_lookup[id]
-				ACCUMULATE_MONITORS_SET(component_record, monitors_set, observers_added_set)
+				local all_monitors = component_record.monitors
+				if all_monitors then
+					-- small optimization in root archetype, as no queries are currently matching
+					-- so we fire all monitors that match as "added" without checking the old archetype
+					FIRE_MONITORS_ADDED(all_monitors, entity, destination, operation_id)
+				end
+
+				local all_observers = component_record.observers_added
+				if all_observers then
+					FIRE_OBSERVERS(all_observers, entity, destination, operation_id)
+				end
+
 				local on_added = component_record.on_added
 				if on_added then
-					firing_hooks[index] = on_added
+					FIRE_SET_HOOKS(on_added, entity, id, values[index])
 				end
-			end
-
-			for monitor in monitors_set do
-				local added = monitor.added
-				if added then
-					local matched = monitor.match(destination)
-					if matched then
-						added(entity)
-					end
-				end
-			end
-
-			FIRE_QUERY_OBSERVERS_SET(observers_added_set, entity, destination)
-
-			for index, hooks in firing_hooks do
-				FIRE_SET_HOOKS(hooks, entity, ids[index], values[index])
 			end
 		else
 			local destination_ids = table.clone(source.components)
 			local inserted: Map<number, boolean> = {}
 
-			-- inserting ids
 			for index, id in ids do
 				local at = FIND_INSERT(destination_ids, id)
 				if at == -1 then
@@ -4073,57 +4457,49 @@ local function world_new()
 
 			archetype_bulk_modify_columns(record.archetype_row, destination, ids, values)
 
-			-- notifying
 			if destination ~= source then
-				local monitors_set: Map<QueryIdMonitor, true> = {}
-				local observers_set: Map<QueryIdObserver, true> = {}
-				local firing_hooks: Map<number, Array<{ SetHook }>> = {}
-
 				for index, was_inserted in inserted do
 					local id = ids[index]
 					local component_record = components_lookup[id]
 
-					local hooks: Array<{ SetHook }>? = nil
 					if was_inserted then
-						-- accumulates monitors and observers_added
-						ACCUMULATE_MONITORS_SET(component_record, monitors_set, observers_set)
-						hooks = component_record.on_added
+						local all_monitors = component_record.monitors
+						local all_observers_added = component_record.observers_added
+						local on_added = component_record.on_added
+
+						if all_monitors then
+							FIRE_MONITORS(all_monitors, entity, source, destination, operation_id)
+						end
+						if all_observers_added then
+							FIRE_OBSERVERS(all_observers_added, entity, destination, operation_id)
+						end
+						if on_added then
+							FIRE_SET_HOOKS(on_added, entity, id, values[index])
+						end
 					else
-						-- accumulates observers_changed only
-						ACCUMULATE_MONITORS_SET(component_record, nil, nil, observers_set)
-						hooks = component_record.on_changed
+						local all_observers_changed = component_record.observers_changed
+						if all_observers_changed then
+							FIRE_OBSERVERS(all_observers_changed, entity, destination, operation_id)
+						end
+
+						local on_changed = component_record.on_changed
+						if on_changed then
+							FIRE_SET_HOOKS(on_changed, entity, id, values[index])
+						end
 					end
-					if hooks then
-						firing_hooks[index] = hooks
-					end
-				end
-
-				for monitor in monitors_set do
-					FIRE_MONITOR(monitor, entity, source, destination)
-				end
-
-				FIRE_QUERY_OBSERVERS_SET(observers_set, entity, destination)
-
-				for index, hooks in firing_hooks do
-					FIRE_SET_HOOKS(hooks, entity, ids[index], values[index])
 				end
 			else
-				local observers_changed_set: Map<QueryIdObserver, true> = {}
-				local firing_hooks: Map<number, Array<{ SetHook }>> = {}
-
 				for index, id in ids do
 					local component_record = components_lookup[id]
-					ACCUMULATE_MONITORS_SET(component_record, nil, nil, observers_changed_set)
+
+					local all_observers_changed = component_record.observers_changed
+					if all_observers_changed then
+						FIRE_OBSERVERS(all_observers_changed, entity, destination, operation_id)
+					end
 					local on_changed = component_record.on_changed
 					if on_changed then
-						firing_hooks[index] = on_changed
+						FIRE_SET_HOOKS(on_changed, entity, id, values[index])
 					end
-				end
-
-				FIRE_QUERY_OBSERVERS_SET(observers_changed_set, entity, destination)
-
-				for index, hooks in firing_hooks do
-					FIRE_SET_HOOKS(hooks, entity, ids[index], values[index])
 				end
 			end
 		end
@@ -4140,6 +4516,9 @@ local function world_new()
 			return
 		end
 
+		local operation_id = current_operation_id + 1
+		current_operation_id = operation_id
+
 		local destination_ids = table.clone(source.components)
 		local removed_ids: { u53 } = {}
 
@@ -4153,13 +4532,9 @@ local function world_new()
 
 		local destination = archetype_ensure(destination_ids)
 		if source ~= destination then
-			local post_removed_callbacks: { () -> () }?
-			local monitors_set: Map<QueryIdMonitor, true> = {}
-			local observers_added_set: Map<QueryIdObserver, true> = {}
-
+			local post_removed_callbacks: { () -> () }? = nil
 			for _, id in removed_ids do
 				local component_record = components_lookup[id]
-				ACCUMULATE_MONITORS_SET(component_record, monitors_set, observers_added_set)
 
 				local removed_hooks = component_record.on_removed
 				if removed_hooks then
@@ -4169,11 +4544,19 @@ local function world_new()
 
 			archetype_move_entity(entity, record, source, destination)
 
-			for monitor in monitors_set do
-				FIRE_MONITOR(monitor, entity, source, destination)
-			end
+			for _, id in removed_ids do
+				local component_record = components_lookup[id]
 
-			FIRE_QUERY_OBSERVERS_SET(observers_added_set, entity, destination)
+				local all_monitors = component_record.monitors
+				if all_monitors then
+					FIRE_MONITORS(all_monitors, entity, source, destination, operation_id)
+				end
+
+				local all_observers = component_record.observers_added
+				if all_observers then
+					FIRE_OBSERVERS(all_observers, entity, destination, operation_id)
+				end
+			end
 
 			if post_removed_callbacks then
 				for _, callback in post_removed_callbacks do
@@ -4312,7 +4695,7 @@ local function world_new()
 
 	local function world_exists(entity: u53): boolean
 		local record = sparse_arr[ENTITY_ID(entity)]
-		if record == nil then
+		if not record then
 			return false
 		end
 		local dense = record.dense
@@ -4337,7 +4720,7 @@ local function world_new()
 			return false
 		end
 		local dense = record.dense
-		if dense <= entity_index.alive then
+		if dense > entity_index.alive then
 			return false
 		end
 		local alive_id = dense_arr[dense]
@@ -4430,7 +4813,7 @@ local function world_new()
 	local function world_added(id: u53, callback: SetHook)
 		local record = component_record_ensure(id)
 		local all_hooks = record.on_added :: Array<{ SetHook }>
-		if not all_hooks then
+		if all_hooks == nil then
 			all_hooks = { {} } :: Array<{ SetHook }>
 			if IS_PAIR(id) then
 				PROPAGATE_PAIR_EVENTS(world, id, record :: PairRecord, all_hooks, function(record)
@@ -4451,7 +4834,7 @@ local function world_new()
 	local function world_changed(id: u53, callback: SetHook)
 		local record = component_record_ensure(id)
 		local all_hooks = record.on_changed :: Array<{ SetHook }>
-		if not all_hooks then
+		if all_hooks == nil then
 			all_hooks = { {} } :: Array<{ SetHook }>
 			if IS_PAIR(id) then
 				PROPAGATE_PAIR_EVENTS(world, id, record :: PairRecord, all_hooks, function(record)
@@ -4472,7 +4855,7 @@ local function world_new()
 	local function world_removed(id: u53, callback: RemovedHook)
 		local record = component_record_ensure(id)
 		local all_hooks = record.on_removed :: Array<{ RemovedHook }>
-		if not all_hooks then
+		if all_hooks == nil then
 			all_hooks = { {} } :: Array<{ RemovedHook }>
 			local is_pair = IS_PAIR(id)
 			if is_pair then
@@ -4586,6 +4969,7 @@ return {
 	changed = ANY(PREREGISTER_CHANGED_HOOK) :: <T>(Component<T>, PreregisteredSetHook<T>) -> Cleanup,
 	removed = ANY(PREREGISTER_REMOVED_HOOK) :: <T>(Component<T>, PreregisteredRemovedHook<T>) -> Cleanup,
 
+	Rest = ANY(ECS_REST) :: Entity,
 	ChildOf = ANY(ECS_CHILDOF) :: Entity,
 	Name = ANY(ECS_NAME) :: Component<string>,
 	Exclusive = ANY(ECS_EXCLUSIVE) :: Entity,
