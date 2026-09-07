@@ -109,7 +109,7 @@ local function isNaN(value: any): boolean
 end
 
 -- Expectation implementation
-local function createExpectation(value: any, inverted: boolean): Expectation
+local function createExpectation(value: any, inverted: boolean, never_of: Expectation?): Expectation
 	local function assert(condition: boolean, message: string, expected: any?, got: any?)
 		if inverted then
 			condition = not condition
@@ -136,8 +136,8 @@ local function createExpectation(value: any, inverted: boolean): Expectation
 		never = nil :: any,
 	}
 
-	-- Create "never" (inverted) version
-	expectation.never = createExpectation(value, not inverted)
+	-- Create "never" (inverted) version, back-linking to avoid infinite recursion
+	expectation.never = never_of or createExpectation(value, not inverted, expectation)
 
 	-- Create "to" chain
 	local to: To = {
@@ -160,12 +160,10 @@ local function createExpectation(value: any, inverted: boolean): Expectation
 		end,
 
 		throw = function(expectedMessage: string?)
-			assert(
-				type(value) == "function",
-				"Expected value to be a function to test for throwing",
-				"function",
-				type(value)
-			)
+			-- checked directly so `never` does not invert this precondition
+			if type(value) ~= "function" then
+				error(`Expected value to be a function to test for throwing\nGot: {type(value)}`, 2)
+			end
 
 			local success, err = pcall(value)
 

@@ -241,12 +241,12 @@ local function printReport(report: TestReport)
 
 		for _, case in suite.cases do
 			if case.status == "failed" then
-				padded(`{color.red_highlight "FAIL"}| {suite.name}`)
-				padded(`   error: {suite.error}`)
+				padded(`{color.red_highlight "FAIL"}| {case.name}`)
+				padded(`   error: {case.error}`)
 			elseif case.status == "skipped" then
-				padded(`{color.yellow "SKIP"}| {suite.name}`)
+				padded(`{color.yellow "SKIP"}| {case.name}`)
 			elseif case.status == "passed" then
-				padded(`{color.green_highlight "PASS"}| {suite.name}`)
+				padded(`{color.green_highlight "PASS"}| {case.name}`)
 			end
 		end
 
@@ -290,12 +290,12 @@ local function runCase(suite: TestSuite, case: TestCase)
 		if not success then
 			result.error = "BEFORE_EACH hook failed: " .. (err or "(unknown error)")
 			result.status = "failed"
+			return result
 		end
-		return result
 	end
 	local success, err = safeCall(case.fn)
 
-	if not success then
+	if success then
 		result.status = "passed"
 	else
 		result.status = "failed"
@@ -355,6 +355,7 @@ local function runSuite(state: PlanState, suite: TestSuite): SuiteResult
 		end
 
 		-- Run test cases
+		suiteResult.status = "passed"
 		for _, case in ipairs(suite.cases) do
 			local caseStartTime = os.clock()
 			local caseResult = runCase(suite, case)
