@@ -163,9 +163,13 @@ export type PairRecord = ComponentRecord & {
 }
 
 export type ComponentRecord = {
+	-- archetype id -> column index of this id inside that archetype. Lookup only.
 	column_index: Map<ArchetypeId, number>,
+	-- dense list of every archetypeid with this component.
+	archetype_ids: { ArchetypeId },
+	-- archetype id -> position in archetype_ids, for swap-remove
+	archetype_slots: Map<ArchetypeId, number>,
 
-	archetype_count: number,
 	flags: Bitset,
 
 	on_added: Array<{ SetHook }>?,
@@ -836,7 +840,7 @@ local function FIND_MATCHED_ARCHETYPES(
 		if not record then
 			continue
 		end
-		local archetype_count = record.archetype_count
+		local archetype_count = #record.archetype_ids
 		if archetype_count < best_record_count then
 			best_record = record
 			best_record_count = archetype_count
@@ -848,7 +852,7 @@ local function FIND_MATCHED_ARCHETYPES(
 	end
 
 	if ignore_empty then
-		for archetype_id in best_record.column_index do
+		for _, archetype_id in best_record.archetype_ids do
 			local archetype = archetypes[archetype_id]
 			if not archetype.alive then
 				continue
@@ -881,7 +885,7 @@ local function FIND_MATCHED_ARCHETYPES(
 			table.insert(compatible, archetype)
 		end
 	else
-		for archetype_id in best_record.column_index do
+		for _, archetype_id in best_record.archetype_ids do
 			local archetype = archetypes[archetype_id]
 			local columns_map = archetype.columns_map
 			local skip = false
@@ -3225,7 +3229,7 @@ local function world_new()
 	local function reachable_invalidate_down(relation: u53, id: u53, record: PairRecord)
 		record.reachable.generation += 1
 
-		for archetype_id in record.column_index do
+		for _, archetype_id in record.archetype_ids do
 			local archetype = archetypes[archetype_id]
 
 			for _, entity in archetype.entities do
@@ -3364,9 +3368,10 @@ local function world_new()
 
 		local record: ComponentRecord = {
 			column_index = {},
+			archetype_ids = {},
+			archetype_slots = {},
 			pairs_count = {},
 
-			archetype_count = 0,
 			flags = nil :: any,
 		}
 
@@ -3554,18 +3559,52 @@ local function world_new()
 		end
 	end
 
-	local function archetype_append_to_pair(record: PairRecord, archetype_id: ArchetypeId, index: number): boolean
+	-- Links an archetypeid to archetypes dense list. Returns false when the archetype was already linked
+	local function record_link_archetype(record: ComponentRecord, archetype_id: ArchetypeId, index: number): boolean
 		local column_index = record.column_index
-		local pairs_count = record.pairs_count
-
-		if not column_index[archetype_id] then
-			column_index[archetype_id] = index
-			pairs_count[archetype_id] = 1
-			return true
-		else
-			pairs_count[archetype_id] += 1
+		if column_index[archetype_id] then
 			return false
 		end
+		column_index[archetype_id] = index
+
+		local archetype_ids = record.archetype_ids
+		local slot = #archetype_ids + 1
+		archetype_ids[slot] = archetype_id
+		record.archetype_slots[archetype_id] = slot
+		return true
+	end
+
+	-- Removes an archetypeid from archetypes dense list.
+	local function record_unlink_archetype(record: ComponentRecord, archetype_id: ArchetypeId)
+		record.column_index[archetype_id] = nil
+		local pairs_count = (record :: PairRecord).pairs_count
+		if pairs_count then
+			pairs_count[archetype_id] = nil
+		end
+
+		local archetype_slots = record.archetype_slots
+		local slot = archetype_slots[archetype_id]
+		if not slot then
+			return
+		end
+		local archetype_ids = record.archetype_ids
+		local last = #archetype_ids
+		if slot ~= last then
+			local moved = archetype_ids[last]
+			archetype_ids[slot] = moved
+			archetype_slots[moved] = slot
+		end
+		archetype_ids[last] = nil
+		archetype_slots[archetype_id] = nil
+	end
+
+	local function archetype_append_to_pair(record: PairRecord, archetype_id: ArchetypeId, index: number): boolean
+		if record_link_archetype(record, archetype_id, index) then
+			record.pairs_count[archetype_id] = 1
+			return true
+		end
+		record.pairs_count[archetype_id] += 1
+		return false
 	end
 
 	local function archetype_move_column_rows(
@@ -3703,7 +3742,7 @@ local function world_new()
 		end
 		-- cascaded deletes can reach the same archetype twice (a nested delete
 		-- destroys it while an outer loop still holds it); destroying again would
-		-- decrement archetype_count once more and refire destruction observers
+		-- unlink it from its records once more and refire destruction observers
 		if archetype.destroyed then
 			return
 		end
@@ -3734,11 +3773,12 @@ local function world_new()
 
 		for id in archetype.columns_map do
 			local component_record = components_lookup[id]
-			component_record.column_index[archetype_id] = nil
-			if (component_record :: PairRecord).pairs_count then
-				(component_record :: PairRecord).pairs_count[archetype_id] = nil
+			-- component_records_release can drop a record before every archetype
+			-- referencing it is destroyed; nothing is left to unlink then.
+			if not component_record then
+				continue
 			end
-			component_record.archetype_count -= 1
+			record_unlink_archetype(component_record, archetype_id)
 
 			-- Records are intentionally kept alive here even when no archetype
 			-- references them anymore. They own hooks, monitors and observers
@@ -3784,14 +3824,13 @@ local function world_new()
 
 		for index, id in ids do
 			local id_record = component_record_ensure(id)
-			id_record.archetype_count += 1
 
 			local is_tag = not CHECK_FLAG(id_record.flags, IS_COMPONENT_FLAG)
 			local column = if is_tag then NULL_ARRAY else {}
 			columns[index] = column
 			columns_map[id] = column
 
-			id_record.column_index[archetype_id] = index
+			record_link_archetype(id_record, archetype_id, index)
 
 			if IS_PAIR(id) then
 				local relation_wildcard = ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)
@@ -3818,7 +3857,6 @@ local function world_new()
 				-- This matches archetype_destroy, which decrements once per archetype.
 				local relation_appended = archetype_append_to_pair(relation_record, archetype_id, index)
 				if relation_appended then
-					relation_record.archetype_count += 1
 					columns_map[relation_wildcard] = column
 				end
 
@@ -3826,7 +3864,6 @@ local function world_new()
 
 				local target_appended = archetype_append_to_pair(target_record, archetype_id, index)
 				if target_appended then
-					target_record.archetype_count += 1
 					columns_map[target_wildcard] = column
 				end
 			end
@@ -4263,6 +4300,12 @@ local function world_new()
 			end
 		end
 
+		-- a hook may have deleted an entity whose cascade already emptied and
+		-- destroyed this archetype; there is nothing left to move
+		if archetype.destroyed then
+			return
+		end
+
 		archetype_bulk_move_entities(archetype, destination, entities)
 
 		for id, component_record in affected_removals do
@@ -4305,6 +4348,12 @@ local function world_new()
 			end
 		end
 
+		-- a hook may have deleted an entity whose cascade already emptied and
+		-- destroyed this archetype; there is nothing left to move
+		if archetype.destroyed then
+			return
+		end
+
 		archetype_bulk_move_entities(archetype, destination, entities)
 
 		if all_monitors then
@@ -4335,9 +4384,19 @@ local function world_new()
 		local monitors = component_record.monitors
 		local observers_added = component_record.observers_added
 
+		local archetype_ids = component_record.archetype_ids
+
 		if destroy_archetypes then
-			for archetype_id in component_record.column_index do
+			-- drain: every step destroys archetype_ids[#archetype_ids], which
+			-- swap-removes it. Archetypes created by hooks mid-loop are appended
+			-- and drained too.
+			while #archetype_ids > 0 do
+				local archetype_id = archetype_ids[#archetype_ids]
 				local source = archetypes[archetype_id]
+				if not source then
+					record_unlink_archetype(component_record, archetype_id)
+					continue
+				end
 				if not source.alive then
 					archetype_destroy(source)
 					continue
@@ -4346,9 +4405,17 @@ local function world_new()
 				archetype_destroy(source)
 			end
 		else
-			for archetype_id in component_record.column_index do
+			-- backwards over a snapshot of the length: a swap-remove caused by a
+			-- hook lands in the already visited tail, and an archetype a hook
+			-- re-creates with this id is appended past the bound (not revisited,
+			-- so a hook that always re-adds cannot loop forever)
+			for i = #archetype_ids, 1, -1 do
+				local archetype_id = archetype_ids[i]
+				if not archetype_id then
+					continue
+				end
 				local source = archetypes[archetype_id]
-				if not source.alive then
+				if not source or not source.alive then
 					continue
 				end
 				archetype_component_wipe(source, id, source.entities :: { any }, on_removed, monitors, observers_added)
@@ -4426,11 +4493,29 @@ local function world_new()
 		end
 	end
 
+	local world_delete_recursive: (entity: u53) -> ()
+
+	-- Deletes every entity of an archetype flagged for cascade deletion. Drains
+	-- from the end so that entities appended by a nested cascade are visited,
+	-- entities removed by a hook (a sibling delete) never leave a nil slot, and
+	-- a bulk move that replaced archetype.entities is picked up on the next
+	-- step. Stops as soon as a nested cascade destroyed the archetype itself.
+	local function archetype_delete_all_entities(archetype: Archetype)
+		while not archetype.destroyed do
+			local entities = archetype.entities
+			local last = #entities
+			if last == 0 then
+				break
+			end
+			world_delete_recursive(entities[last] :: any)
+		end
+	end
+
 	-- Cascaded deletes (OnDeleteTarget, children, relation cleanup) go through
 	-- here. Cycles such as A ChildOf B, B ChildOf A, or self pairs reach an
 	-- entity that is already being torn down by an outer call; skip it silently.
 	-- world_delete (public) errors on that case instead.
-	local function world_delete_recursive(entity: u53)
+	function world_delete_recursive(entity: u53)
 		local record = get_entity_record_asserts_alive(entity)
 		if not record then
 			return
@@ -4454,16 +4539,16 @@ local function world_new()
 		if component_record then
 			local has_delete = CHECK_FLAG(component_record.flags, HAS_DELETE_FLAG)
 			if has_delete then
-				for archetype_id in component_record.column_index do
+				local archetype_ids = component_record.archetype_ids
+				while #archetype_ids > 0 do
+					local archetype_id = archetype_ids[#archetype_ids]
 					local archetype = archetypes[archetype_id]
-					local entities = archetype.entities
-					local last_row = #entities
-
-					for row = last_row, 1, -1 do
-						local child = entities[row]
-						world_delete_recursive(child :: any)
+					if not archetype then
+						record_unlink_archetype(component_record, archetype_id)
+						continue
 					end
 
+					archetype_delete_all_entities(archetype)
 					archetype_destroy(archetype)
 				end
 			else
@@ -4472,9 +4557,18 @@ local function world_new()
 		end
 		if target_record then
 			local removing: Map<u53, ComponentRecord> = {}
+			local archetype_ids = target_record.archetype_ids
 
-			for archetype_id in target_record.column_index do
+			-- drain loop: every step ends by destroying archetype_ids[#archetype_ids],
+			-- which swap-removes it. Nested cascades may append archetypes that
+			-- still hold a pair to this entity; they are drained too.
+			while #archetype_ids > 0 do
+				local archetype_id = archetype_ids[#archetype_ids]
 				local archetype = archetypes[archetype_id]
+				if not archetype then
+					record_unlink_archetype(target_record, archetype_id)
+					continue
+				end
 
 				-- Dead archetypes hold no entities, so there is nothing to wipe or
 				-- move. They still have to be destroyed.
@@ -4508,10 +4602,7 @@ local function world_new()
 				end
 
 				if deleted_any then
-					for row = #entities, 1, -1 do
-						local child = entities[row]
-						world_delete_recursive(child)
-					end
+					archetype_delete_all_entities(archetype)
 				else
 					if removing_count == 1 then
 						for id, id_record in removing do
@@ -4538,29 +4629,35 @@ local function world_new()
 		end
 		if relation_record then
 			local column_index = relation_record.column_index
+			local archetype_ids = relation_record.archetype_ids
 			local has_delete = CHECK_FLAG(relation_record.flags, HAS_DELETE_FLAG)
 
 			if has_delete then
-				for archetype_id in column_index do
+				while #archetype_ids > 0 do
+					local archetype_id = archetype_ids[#archetype_ids]
 					local archetype = archetypes[archetype_id]
+					if not archetype then
+						record_unlink_archetype(relation_record, archetype_id)
+						continue
+					end
 					if not archetype.alive then
 						archetype_destroy(archetype)
 						continue
 					end
 
-					local entities = archetype.entities
-					local last_row = #entities
-
-					for i = last_row, 1, -1 do
-						world_delete_recursive(entities[i] :: any)
-					end
+					archetype_delete_all_entities(archetype)
 					archetype_destroy(archetype)
 				end
 			else
 				local pairs_count = relation_record.pairs_count
 
-				for archetype_id in column_index do
+				while #archetype_ids > 0 do
+					local archetype_id = archetype_ids[#archetype_ids]
 					local archetype = archetypes[archetype_id]
+					if not archetype then
+						record_unlink_archetype(relation_record, archetype_id)
+						continue
+					end
 
 					-- Dead archetypes hold no entities, so there is nothing to wipe or
 					-- move. They still have to be destroyed.
@@ -5125,31 +5222,42 @@ local function world_new()
 			return NOOP :: () -> u53
 		end
 
-		local component_archetypes = component_record.column_index
-		local archetype_id = next(component_archetypes) :: number
-		local archetype: Archetype? = archetype_id and archetypes[archetype_id]
-		if not archetype then
-			return NOOP :: () -> u53
-		end
-
-		local entities = archetype.entities
-		local row = #entities
+		-- Walk archetype_ids backwards by index: if the caller destroys the
+		-- current archetype (by deleting its last entity) the swap-remove pulls
+		-- the tail id into a slot already behind the cursor. Rows also walk
+		-- backwards so deleting the yielded entity is safe.
+		local archetype_ids = component_record.archetype_ids
+		local index = #archetype_ids + 1
+		local archetype: Archetype? = nil
+		local row = 0
 
 		return function(): u53
-			local entity = entities[row]
-			while not entity do
-				archetype_id = next(component_archetypes, archetype_id) :: number
+			while true do
+				if archetype and not archetype.destroyed then
+					-- re-read: a bulk move replaces archetype.entities
+					local entities = archetype.entities
+					if row > #entities then
+						row = #entities
+					end
+					local entity = entities[row]
+					if entity then
+						row -= 1
+						return entity :: any
+					end
+				end
+
+				index -= 1
+				local archetype_id = archetype_ids[index]
 				if not archetype_id then
 					return nil :: any
 				end
-
 				archetype = archetypes[archetype_id]
-				entities = archetype.entities
-				row = #entities
-				entity = entities[row]
+				if archetype and archetype.alive then
+					row = #archetype.entities
+				else
+					archetype = nil
+				end
 			end
-			row -= 1
-			return entity :: any
 		end
 	end
 

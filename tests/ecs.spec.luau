@@ -2008,7 +2008,7 @@ TEST("internal: component records", function()
 		expect(world.components_lookup[C]).to.equal(c_record)
 		expect(bit32.btest(c_record.flags, 1)).to.equal(true)
 		expect(bit32.btest(t_record.flags, 1)).to.equal(false)
-		expect(c_record.archetype_count).to.equal(0)
+		expect(#c_record.archetype_ids).to.equal(0)
 	end)
 
 	CASE("component_record_ensure returns the existing record", function()
@@ -2075,7 +2075,7 @@ TEST("internal: component records", function()
 		world.bulk_add(e2, { A, B })
 
 		local record = world.components_lookup[A]
-		expect(record.archetype_count).to.equal(2)
+		expect(#record.archetype_ids).to.equal(2)
 		expect(count_keys(record.column_index)).to.equal(2)
 	end)
 
@@ -2090,7 +2090,7 @@ TEST("internal: component records", function()
 
 		local archetype = (world.internal.get_entity_record(e) :: any).archetype
 		local relation_record = world.components_lookup[ecs.pair(R, ecs.Wildcard)] :: any
-		expect(relation_record.archetype_count).to.equal(2)
+		expect(#relation_record.archetype_ids).to.equal(2)
 		expect(relation_record.pairs_count[archetype.archetype_id]).to.equal(2)
 	end)
 end)
@@ -2182,12 +2182,12 @@ TEST("internal: archetype graph", function()
 		expect(world.archetypes[ab.archetype_id]).to.beNil()
 		expect(world.archetypes_lookup[ab.hash]).to.beNil()
 		expect(a.forward_edges[B]).to.beNil()
-		expect(record_a.archetype_count).to.equal(1)
-		expect(record_b.archetype_count).to.equal(0)
+		expect(#record_a.archetype_ids).to.equal(1)
+		expect(#record_b.archetype_ids).to.equal(0)
 		expect(record_a.column_index[ab.archetype_id]).to.beNil()
 
 		internal.archetype_destroy(ab)
-		expect(record_a.archetype_count).to.equal(1)
+		expect(#record_a.archetype_ids).to.equal(1)
 
 		internal.archetype_destroy(root)
 		expect(root.destroyed).to.equal(false)
@@ -2339,6 +2339,277 @@ TEST("internal: archetype rows", function()
 end)
 
 -- preregistration -------------------------------------------------------------------
+
+TEST("cascade deletion under mutation", function()
+	local pair = ecs.pair
+
+	-- every record's dense archetype list must mirror its column_index map
+	local function expect_record_lists_consistent(world: ecs.World)
+		for id, record in world.components_lookup do
+			local archetype_ids = record.archetype_ids
+			expect(#archetype_ids).to.equal(count_keys(record.column_index))
+			for slot, archetype_id in archetype_ids do
+				expect(record.archetype_slots[archetype_id]).to.equal(slot)
+				expect(record.column_index[archetype_id]).never.to.beNil()
+				expect(world.archetypes[archetype_id]).never.to.beNil()
+			end
+		end
+	end
+
+	-- no archetype may keep a handle that is no longer alive
+	local function expect_no_dead_rows(world: ecs.World)
+		for _, archetype in world.archetypes do
+			for _, entity in archetype.entities do
+				expect(world.alive(entity)).to.equal(true)
+			end
+		end
+	end
+
+	CASE("archetypes created by a nested cascade are still swept for pairs to the dead target", function()
+		local world = ecs.world()
+		local Owns = world.tag()
+		local Attached = world.tag()
+		local RelX = world.tag()
+		world.add(Owns, pair(ecs.OnDeleteTarget, ecs.Delete))
+
+		local T = world.entity()
+		-- extra archetypes referencing T perturb the sweep order
+		for _ = 1, 4 do
+			local D = world.tag()
+			world.add(world.entity(), pair(D, T))
+		end
+
+		local child = world.entity()
+		local grandchild = world.entity()
+		-- grandchild's archetype exists before child's, so the sweep can reach
+		-- child first and move grandchild into a brand new {pair(RelX, T)}
+		world.add(grandchild, pair(Attached, child))
+		world.add(grandchild, pair(RelX, T))
+		world.add(child, pair(Owns, T))
+
+		world.delete(T)
+
+		expect(world.alive(child)).to.equal(false)
+		expect(world.alive(grandchild)).to.equal(true)
+		expect(world.has(grandchild, pair(RelX, T))).to.equal(false)
+		expect(world.has(grandchild, pair(Attached, child))).to.equal(false)
+		expect(world.target(grandchild, RelX)).to.beNil()
+		expect(world.components_lookup[pair(RelX, T)]).to.beNil()
+
+		-- a recycled id must not be re-targeted by a leftover pair
+		local fresh = world.entity()
+		expect(world.target(grandchild, RelX)).to.beNil()
+		expect(world.has(grandchild, pair(RelX, fresh))).to.equal(false)
+
+		expect_record_lists_consistent(world)
+		expect_no_dead_rows(world)
+	end)
+
+	CASE("entities moved into a delete-flagged archetype mid-cascade are deleted too", function()
+		local world = ecs.world()
+		local Owns = world.tag()
+		local Attached = world.tag()
+		world.add(Owns, pair(ecs.OnDeleteTarget, ecs.Delete))
+
+		local T = world.entity()
+		local e1 = world.entity()
+		local e2 = world.entity()
+		world.add(e1, pair(Owns, T))
+		-- deleting e1 strips pair(Attached, e1) from e2, moving e2 into e1's
+		-- archetype while the outer sweep is still draining it
+		world.add(e2, pair(Owns, T))
+		world.add(e2, pair(Attached, e1))
+
+		world.delete(T)
+
+		expect(world.alive(T)).to.equal(false)
+		expect(world.alive(e1)).to.equal(false)
+		expect(world.alive(e2)).to.equal(false)
+		expect(world.exists(e2)).to.equal(false)
+
+		expect_record_lists_consistent(world)
+		expect_no_dead_rows(world)
+	end)
+
+	CASE("longer chains through a delete-flagged archetype leave no survivors", function()
+		local world = ecs.world()
+		local Owns = world.tag()
+		local Attached = world.tag()
+		world.add(Owns, pair(ecs.OnDeleteTarget, ecs.Delete))
+
+		local T = world.entity()
+		local chain = {}
+		for i = 1, 6 do
+			local e = world.entity()
+			world.add(e, pair(Owns, T))
+			if i > 1 then
+				world.add(e, pair(Attached, chain[i - 1]))
+			end
+			chain[i] = e
+		end
+
+		world.delete(T)
+
+		for _, e in chain do
+			expect(world.alive(e)).to.equal(false)
+		end
+		expect_record_lists_consistent(world)
+		expect_no_dead_rows(world)
+	end)
+
+	CASE("a removed hook deleting a sibling during a cascade does not error", function()
+		local world = ecs.world()
+		local R = world.tag()
+		local D = world.tag()
+		world.add(R, pair(ecs.OnDeleteTarget, ecs.Delete))
+
+		local T = world.entity()
+		local e1 = world.entity()
+		local e2 = world.entity()
+		world.add(e1, pair(R, T))
+		world.add(e1, D)
+		world.add(e2, pair(R, T))
+		world.add(e2, D)
+
+		local fired = 0
+		world.removed(D, function(entity)
+			fired += 1
+			local sibling = if entity == e1 then e2 else e1
+			if world.alive(sibling) and not world.deleting(sibling) then
+				world.delete(sibling)
+			end
+		end)
+
+		world.delete(T)
+
+		expect(world.alive(T)).to.equal(false)
+		expect(world.alive(e1)).to.equal(false)
+		expect(world.alive(e2)).to.equal(false)
+		expect(world.deleting(T)).to.equal(false)
+		expect(fired).to.equal(2)
+
+		expect_record_lists_consistent(world)
+		expect_no_dead_rows(world)
+	end)
+
+	CASE("a nested cascade may destroy the archetype the outer sweep holds", function()
+		local world = ecs.world()
+		local Owns = world.tag()
+		world.add(Owns, pair(ecs.OnDeleteTarget, ecs.Delete))
+
+		local T = world.entity()
+		local c1 = world.entity()
+		local c2 = world.entity()
+		world.add(c1, pair(Owns, T))
+		-- deleting c1 cascades into c2, which shares the outer archetype's pair
+		world.add(c2, pair(Owns, T))
+		world.add(c2, pair(Owns, c1))
+
+		world.delete(T)
+
+		expect(world.alive(T)).to.equal(false)
+		expect(world.alive(c1)).to.equal(false)
+		expect(world.alive(c2)).to.equal(false)
+
+		expect_record_lists_consistent(world)
+		expect_no_dead_rows(world)
+	end)
+
+	CASE("a removed hook whose delete empties the archetype being wiped is safe", function()
+		local world = ecs.world()
+		local R = world.tag()
+		local Owns = world.tag()
+		world.add(Owns, pair(ecs.OnDeleteTarget, ecs.Delete))
+
+		local T = world.entity()
+		local X = world.entity()
+		local e = world.entity()
+		world.add(e, pair(R, T))
+		world.add(e, pair(Owns, X))
+
+		-- stripping pair(R, T) fires this hook; deleting X cascades into e and
+		-- destroys the very archetype that was being wiped
+		world.removed(pair(R, ecs.Wildcard), function()
+			if world.alive(X) then
+				world.delete(X)
+			end
+		end)
+
+		world.delete(T)
+
+		expect(world.alive(T)).to.equal(false)
+		expect(world.alive(X)).to.equal(false)
+		expect(world.alive(e)).to.equal(false)
+
+		expect_record_lists_consistent(world)
+		expect_no_dead_rows(world)
+	end)
+
+	CASE("deleting a relation with a delete flag drains archetypes appended mid-cascade", function()
+		local world = ecs.world()
+		local R = world.tag()
+		local Attached = world.tag()
+		world.add(R, pair(ecs.OnDelete, ecs.Delete))
+
+		local a = world.entity()
+		local b = world.entity()
+		local t1 = world.entity()
+		local t2 = world.entity()
+		world.add(a, pair(R, t1))
+		world.add(b, pair(R, t2))
+		world.add(b, pair(Attached, a))
+
+		world.delete(R)
+
+		expect(world.alive(R)).to.equal(false)
+		expect(world.alive(a)).to.equal(false)
+		expect(world.alive(b)).to.equal(false)
+		expect(world.alive(t1)).to.equal(true)
+
+		expect_record_lists_consistent(world)
+		expect_no_dead_rows(world)
+	end)
+
+	CASE("world.each survives deleting the yielded entity and its archetype", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local B = world.tag()
+		local C = world.tag()
+		local seen = {}
+		local all = {}
+		for i = 1, 6 do
+			local e = world.entity()
+			world.add(e, A)
+			if i % 2 == 0 then
+				world.add(e, B)
+			end
+			if i % 3 == 0 then
+				world.add(e, C)
+			end
+			table.insert(all, e)
+		end
+
+		for entity in world.each(A) do
+			table.insert(seen, entity)
+			world.delete(entity)
+		end
+
+		expect(sorted(seen)).to.equal(sorted(all))
+		expect(collect(world.each(A))).to.equal {}
+		expect_record_lists_consistent(world)
+	end)
+
+	CASE("bulk_add with a repeated id from the root archetype links the record once", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local e = world.entity()
+		world.bulk_add(e, { A, A })
+
+		local record = world.components_lookup[A]
+		expect(#record.archetype_ids).to.equal(count_keys(record.column_index))
+		expect_record_lists_consistent(world)
+	end)
+end)
 
 TEST("preregistration", function()
 	CASE("preregistered ids are available in every new world", function()
