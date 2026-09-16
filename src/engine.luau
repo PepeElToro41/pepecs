@@ -13,75 +13,21 @@
 -- Queries whose terms are all plain `$this` terms (Class S) never build a
 -- program at all; they iterate with the same shape as `world.query`.
 
-type u24 = number
-type u53 = number
-type Column = { any }
-type Map<K, V> = { [K]: V }
+local types = require "./types"
 
-type Archetype = {
-	archetype_id: number,
-	alive: boolean,
-	destroyed: boolean,
-	entities: { u53 },
-	columns: { Column },
-	components: { u53 },
-	columns_map: Map<u53, Column>,
-}
+type u24 = types.u24
+type u53 = types.u53
+type Column = types.Column
+type Map<K, V> = types.Map<K, V>
+type Entity = types.Entity
+type Archetype = types.Archetype
+type ComponentRecord = types.ComponentRecord
+type PairRecord = types.PairRecord
+type EntityRecord = types.EntityRecord
+type World = types.World
 
-type ComponentRecord = {
-	column_index: Map<number, number>,
-	archetype_ids: { number },
-}
-
-type PairRecord = ComponentRecord & {
-	pairs_count: Map<number, number>,
-}
-
-type EntityRecord = {
-	archetype: Archetype,
-	archetype_row: number,
-	dense: number,
-}
-
-type EntityIndex = {
-	dense: { u53 },
-	sparse: Map<u24, EntityRecord>,
-	alive: number,
-}
-
-type WorldInternal = {
-	entity_index: EntityIndex,
-
-	ECS_PAIR: (first: u53, second: u53) -> u53,
-	PAIR_FIRST: (id: u53) -> u24,
-	PAIR_SECOND: (id: u53) -> u24,
-	IS_PAIR: (id: u53) -> boolean,
-	ECS_WILDCARD: u53,
-	ECS_TRANSITIVE: u53,
-	NULL_ARRAY: Column,
-	get_entity_alive: (entity_id: u24) -> u53?,
-
-	get_archetypes_count: () -> number,
-	MATCH_ARCHETYPE: (with_ids: { u53 }, without_ids: { u53 }?, archetype: Archetype) -> boolean,
-	FIND_MATCHED_ARCHETYPES: (
-		world: any,
-		with_ids: { u53 },
-		without_ids: { u53 }?,
-		ignore_empty: boolean
-	) -> { Archetype },
-	OBSERVE_MATCHED_ARCHETYPES: (
-		world: any,
-		with_ids: { u53 },
-		without_ids: { u53 }?
-	) -> ({ Archetype }, Map<number, number>, () -> ()),
-}
-
-type World = {
-	components_lookup: Map<u53, ComponentRecord>,
-	archetypes: Map<number, Archetype>,
-	internal: WorldInternal,
-	has: (entity: u53, id: u53) -> boolean,
-}
+export type QueryBuilder = types.QueryBuilder
+type Query = types.EngineQuery
 
 local MODE_TERM = 1
 local MODE_WITH = 2
@@ -107,23 +53,6 @@ type Term = {
 	rel_wc: u53,
 }
 
-export type QueryBuilder = {
-	term: (self: QueryBuilder, id: any) -> QueryBuilder,
-	with: (self: QueryBuilder, id: any) -> QueryBuilder,
-	without: (self: QueryBuilder, id: any) -> QueryBuilder,
-
-	optional: (self: QueryBuilder) -> QueryBuilder,
-	bor: (self: QueryBuilder) -> QueryBuilder,
-	wildcard: (self: QueryBuilder) -> QueryBuilder,
-	target: (self: QueryBuilder, target: any) -> QueryBuilder,
-	from: (self: QueryBuilder, source: string) -> QueryBuilder,
-	up: (self: QueryBuilder, relation: any) -> QueryBuilder,
-	self: (self: QueryBuilder) -> QueryBuilder,
-	transitive: (self: QueryBuilder) -> QueryBuilder,
-
-	build: (self: QueryBuilder) -> Query,
-}
-
 type BuilderInternal = {
 	world: World,
 	terms: { Term },
@@ -131,20 +60,6 @@ type BuilderInternal = {
 	pending_or: Term?,
 	n_out: number,
 }
-
-export type Query = typeof(setmetatable(
-	{} :: {
-		iter: (self: Query) -> () -> ...any,
-		archetypes: (self: Query) -> { any },
-		match: (self: Query, archetype: any) -> boolean,
-		rematch: (self: Query) -> { any },
-		cached: (self: Query) -> Query,
-		cleanup: (self: Query) -> (),
-		var: (self: Query, name: string) -> any,
-		is_cached: boolean,
-	},
-	{} :: { __iter: (self: Query) -> () -> ...any }
-))
 
 type Prematcher = {
 	with_ids: { u53 },
@@ -360,9 +275,8 @@ function builder_mt.up(builder: BuilderInternal, relation: u53): BuilderInternal
 	return builder
 end
 
--- :transitive() — match (R, T) when the entity holds it or reaches T through
--- a chain of R pairs (first target per level). Relations tagged with
--- ecs.Transitive get this automatically.
+-- :transitive() — this is just term(pair(R, T)):up(R). No special logic for multiple pairs,
+-- so this only works with exclusive relationships
 function builder_mt.transitive(builder: BuilderInternal): BuilderInternal
 	local term = builder_pending(builder, "transitive")
 	if term.up then
@@ -381,16 +295,12 @@ builder_mt["self"] = function(builder: BuilderInternal): BuilderInternal
 	return builder
 end
 
--------------------------------------------------------------------------------
--- up traversal
--------------------------------------------------------------------------------
-
--- Walks up `rel_wc` from `archetype` until an archetype holding `id` is found.
+-- traverses up `rel_wc` from `archetype` until an archetype holding `id` is found.
 -- Returns the holder row (0 when `include_self` hit the starting archetype)
 -- and the column, or nil when nothing up the chain has `id`. Follows the first
 -- target of the relation on every level and gives up after MAX_UP_DEPTH so
 -- transient relation cycles cannot hang the query.
-local function walk_up(
+local function traverse_up(
 	components_lookup: Map<u53, ComponentRecord>,
 	sparse: Map<u24, EntityRecord>,
 	PAIR_SECOND: (u53) -> u24,
@@ -483,6 +393,8 @@ end
 local function compile(builder: BuilderInternal): QueryInternal
 	local world = builder.world
 	local internal = world.internal
+	-- ids are plain numbers inside the engine
+	local has: (u53, u53) -> boolean = world.has :: any
 	local ECS_PAIR = internal.ECS_PAIR
 	local ECS_WILDCARD = internal.ECS_WILDCARD
 
@@ -523,7 +435,7 @@ local function compile(builder: BuilderInternal): QueryInternal
 		if type(target) == "string" then
 			term.tgt_var = var_index(target)
 			term.rid = ECS_PAIR(term.id, ECS_WILDCARD)
-			if term.transitive or world.has(term.id, ECS_TRANSITIVE) then
+			if term.transitive or has(term.id, ECS_TRANSITIVE) then
 				error "transitive terms with a variable target are not supported yet"
 			end
 		elseif type(target) == "number" then
@@ -543,7 +455,7 @@ local function compile(builder: BuilderInternal): QueryInternal
 
 		-- transitive (R, T): (R, T) on self, or on anything reached through R
 		if relation and not term.up then
-			if term.transitive or world.has(relation, ECS_TRANSITIVE) then
+			if term.transitive or has(relation, ECS_TRANSITIVE) then
 				term.transitive = true
 				term.up = relation
 				term.self = true
@@ -949,7 +861,7 @@ local function iter_static(query: QueryInternal, list: { Archetype }): () -> ...
 	local A, B, C, D, E, F, G, H = unpack(query.term_ids)
 
 	local index = 0
-	local entities: { u53 } = EMPTY
+	local entities: { Entity } = EMPTY
 	local row = 0
 	local a: Column, b: Column, c: Column, d: Column
 	local e: Column, f: Column, g: Column, h: Column
@@ -1220,10 +1132,6 @@ local function iter_static(query: QueryInternal, list: { Archetype }): () -> ...
 	end
 end
 
--------------------------------------------------------------------------------
--- iteration: program class
--------------------------------------------------------------------------------
-
 local function iter_program(query: QueryInternal, list: { Archetype }): () -> ...any
 	local world = query.world
 	local internal = world.internal
@@ -1249,7 +1157,7 @@ local function iter_program(query: QueryInternal, list: { Archetype }): () -> ..
 	local rm: { number } = table.create(n_out, 0)
 	local rb: { number } = table.create(n_out, 1)
 
-	local res_entities: { u53 } = EMPTY
+	local res_entities: { Entity } = EMPTY
 	local res_lo = 1
 	local res_hi = 0
 
@@ -1285,6 +1193,7 @@ local function iter_program(query: QueryInternal, list: { Archetype }): () -> ..
 				if not archetype then
 					return false
 				end
+
 				ctx[pc * 2 - 1] = index
 				var_arch[THIS_VAR], var_row[THIS_VAR], var_ent[THIS_VAR] = archetype, 0, nil
 				res_entities = archetype.entities
@@ -1294,18 +1203,20 @@ local function iter_program(query: QueryInternal, list: { Archetype }): () -> ..
 				return true
 			elseif op == OP_TERM_OPT then
 				local src = code[off + 4]
-				local out = code[off + 6]
-				local column = var_arch[src].columns_map[code[off + 5]]
+				local term = code[off + 5]
+				local output = code[off + 6]
+
+				local column = var_arch[src].columns_map[term]
 				if column then
 					local m = code[off + 7]
-					rc[out], rm[out], rb[out] = column, m, (1 - m) * var_row[src]
+					rc[output], rm[output], rb[output] = column, m, (1 - m) * var_row[src]
 				else
-					rc[out], rm[out], rb[out] = EMPTY, 0, 1
+					rc[output], rm[output], rb[output] = EMPTY, 0, 1
 				end
 				ok = true
 			elseif op == OP_UP_TERM then
 				local src = code[off + 4]
-				local row, column = walk_up(
+				local row, column = traverse_up(
 					components_lookup,
 					sparse,
 					PAIR_SECOND,
@@ -1371,7 +1282,7 @@ local function iter_program(query: QueryInternal, list: { Archetype }): () -> ..
 			elseif op == OP_WITHOUT then
 				ok = var_arch[code[off + 4]].columns_map[code[off + 5]] == nil
 			elseif op == OP_UP_WITH or op == OP_UP_WITHOUT then
-				local _, column = walk_up(
+				local _, column = traverse_up(
 					components_lookup,
 					sparse,
 					PAIR_SECOND,
@@ -1408,7 +1319,7 @@ local function iter_program(query: QueryInternal, list: { Archetype }): () -> ..
 					ok = false
 				else
 					ctx[pc * 2 - 1] = row
-					var_ent[THIS_VAR], var_row[THIS_VAR] = entities[row], row
+					var_ent[THIS_VAR], var_row[THIS_VAR] = entities[row] :: any, row
 					res_lo, res_hi = row, row
 					ok = true
 				end
@@ -1448,7 +1359,7 @@ local function iter_program(query: QueryInternal, list: { Archetype }): () -> ..
 								row = count
 							end
 							if row >= 1 then
-								var_arch[var], var_row[var], var_ent[var] = archetype, row, entities[row]
+								var_arch[var], var_row[var], var_ent[var] = archetype, row, entities[row] :: any
 								local out = if op == OP_FROM_SELECT then code[off + 6] else code[off + 7]
 								if out ~= 0 then
 									rc[out], rm[out], rb[out] =
@@ -1497,7 +1408,7 @@ local function iter_program(query: QueryInternal, list: { Archetype }): () -> ..
 	local cur_row = 0
 	local row_lo = 1
 	local redo = false
-	local entities: { u53 } = EMPTY
+	local entities: { Entity } = EMPTY
 
 	local a: Column, b: Column, c: Column, d: Column
 	local e: Column, f: Column, g: Column, h: Column
