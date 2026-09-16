@@ -3272,6 +3272,621 @@ TEST("pair hook propagation", function()
 	end)
 end)
 
+-- query engine -------------------------------------------------------------------
+
+TEST("query engine", function()
+	local function rows(query: any): { { any } }
+		local out = {}
+		for entity, a, b, c in query do
+			table.insert(out, { entity, a, b, c })
+		end
+		return out
+	end
+
+	local function entities_of(query: any): { any }
+		local out = {}
+		for entity in query do
+			table.insert(out, entity)
+		end
+		return out
+	end
+
+	CASE("static: term outputs match world.query for 1 to 10 terms", function()
+		for n = 1, 10 do
+			local world = ecs.world()
+			local e1 = world.entity()
+			local ids = with_components(world, e1, n)
+			local e2 = world.entity()
+			for i, id in ids do
+				world.set(e2, id, -i)
+			end
+
+			local builder = world.query_build()
+			for _, id in ids do
+				builder:term(id)
+			end
+			local query = builder:build()
+			expect(query.is_static).to.equal(true)
+
+			local seen = {}
+			local iter = query:iter()
+			while true do
+				local packed = { iter() }
+				local entity = table.remove(packed, 1)
+				if entity == nil then
+					break
+				end
+				expect(#packed).to.equal(n)
+				seen[entity] = packed
+			end
+
+			expect(count_keys(seen)).to.equal(2)
+			for i = 1, n do
+				expect(seen[e1][i]).to.equal(i * 10)
+				expect(seen[e2][i]).to.equal(-i)
+			end
+		end
+	end)
+
+	CASE("static: with narrows, without excludes, no outputs yields entities only", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local B = world.tag()
+		local C = world.tag()
+		local ab = world.entity()
+		local abc = world.entity()
+		local a = world.entity()
+		world.bulk_add(ab, { A, B })
+		world.bulk_add(abc, { A, B, C })
+		world.add(a, A)
+
+		expect(sorted(entities_of(world.query_build():with(A):with(B):build()))).to.equal(sorted { ab, abc })
+		expect(entities_of(world.query_build():with(A):without(B):build())).to.equal { a }
+		expect(entities_of(world.query_build():with(A):with(B):without(C):build())).to.equal { ab }
+	end)
+
+	CASE("static: optional yields nil when the component is missing", function()
+		local world = ecs.world()
+		local A = world.component()
+		local B = world.component()
+		local e1 = world.entity()
+		local e2 = world.entity()
+		world.set(e1, A, 1)
+		world.set(e2, A, 2)
+		world.set(e2, B, "b")
+
+		local query = world.query_build():term(A):term(B):optional():build()
+		expect(query.is_static).to.equal(true)
+		local seen = {}
+		for entity, a, b in query do
+			seen[entity] = { a, b }
+		end
+		expect(seen[e1]).to.equal { 1 }
+		expect(seen[e2]).to.equal { 2, "b" }
+		expect(count_keys(seen)).to.equal(2)
+	end)
+
+	CASE("static: wildcard and concrete targets", function()
+		local world = ecs.world()
+		local R = world.component()
+		local T1 = world.entity()
+		local T2 = world.entity()
+		local e1 = world.entity()
+		local e2 = world.entity()
+		world.set(e1, ecs.pair(R, T1), "one")
+		world.set(e2, ecs.pair(R, T2), "two")
+
+		local seen = {}
+		for entity, value in world.query_build():term(R):wildcard():build() do
+			seen[entity] = value
+		end
+		expect(seen).to.equal { [e1] = "one", [e2] = "two" }
+
+		expect(rows(world.query_build():term(R):target(T2):build())).to.equal { { e2, "two" } }
+		expect(entities_of(world.query_build():with(R):target(T1):build())).to.equal { e1 }
+
+		local other = world.entity()
+		world.add(other, T1)
+		expect(entities_of(world.query_build():with(T1):without(R):wildcard():build())).to.equal { other }
+	end)
+
+	CASE("static: deleting the yielded entity mid-iteration visits every entity once", function()
+		local world = ecs.world()
+		local A = world.component()
+		local expected = {}
+		for i = 1, 20 do
+			local e = world.entity()
+			world.set(e, A, i)
+			expected[e] = true
+		end
+
+		local seen = {}
+		for entity in world.query_build():term(A):build() do
+			expect(seen[entity]).to.beNil()
+			seen[entity] = true
+			world.delete(entity)
+		end
+		expect(seen).to.equal(expected)
+		expect(entities_of(world.query_build():term(A):build())).to.equal {}
+	end)
+
+	CASE("non cached queries see new archetypes on the next iteration", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local B = world.tag()
+		local e1 = world.entity()
+		world.add(e1, A)
+
+		local query = world.query_build():with(A):build()
+		expect(entities_of(query)).to.equal { e1 }
+		expect(#query:archetypes()).to.equal(1)
+
+		local e2 = world.entity()
+		world.bulk_add(e2, { A, B })
+		expect(sorted(entities_of(query))).to.equal(sorted { e1, e2 })
+		expect(#query:archetypes()).to.equal(2)
+	end)
+
+	CASE("up walks the relation until the component is found", function()
+		local world = ecs.world()
+		local Model = world.component()
+		local Tag = world.tag()
+		local grandparent = world.entity()
+		local parent = world.entity()
+		local child1 = world.entity()
+		local child2 = world.entity()
+		local orphan = world.entity()
+		local root = world.entity()
+		world.set(grandparent, Model, "gp")
+		world.add(parent, ecs.pair(ecs.ChildOf, grandparent))
+		world.add(child1, ecs.pair(ecs.ChildOf, parent))
+		world.add(child2, ecs.pair(ecs.ChildOf, parent))
+		world.add(orphan, ecs.pair(ecs.ChildOf, root))
+		world.add(root, Tag)
+		world.add(orphan, Tag)
+		world.add(child1, Tag)
+		world.add(child2, Tag)
+		world.add(parent, Tag)
+
+		local query = world.query_build():with(Tag):term(Model):up(ecs.ChildOf):build()
+		expect(query.is_static).to.equal(false)
+
+		local seen = {}
+		for entity, model in query do
+			seen[entity] = model
+		end
+		expect(seen).to.equal { [parent] = "gp", [child1] = "gp", [child2] = "gp" }
+
+		-- parent gains Model: children now read the closer value, re-resolved per iteration
+		world.set(parent, Model, "p")
+		seen = {}
+		for entity, model in query do
+			seen[entity] = model
+		end
+		expect(seen).to.equal { [parent] = "gp", [child1] = "p", [child2] = "p" }
+
+		-- reparenting changes the result
+		world.add(child1, ecs.pair(ecs.ChildOf, grandparent))
+		seen = {}
+		for entity, model in query do
+			seen[entity] = model
+		end
+		expect(seen).to.equal { [parent] = "gp", [child1] = "gp", [child2] = "p" }
+	end)
+
+	CASE("up with optional, self and without", function()
+		local world = ecs.world()
+		local Model = world.component()
+		local Disabled = world.tag()
+		local Tag = world.tag()
+		local parent = world.entity()
+		local child = world.entity()
+		local own = world.entity()
+		local root = world.entity()
+		world.set(parent, Model, "p")
+		world.set(own, Model, "own")
+		world.add(child, ecs.pair(ecs.ChildOf, parent))
+		world.add(own, ecs.pair(ecs.ChildOf, parent))
+		world.add(child, Tag)
+		world.add(own, Tag)
+		world.add(root, Tag)
+
+		local seen = {}
+		for entity, model in world.query_build():with(Tag):term(Model):up(ecs.ChildOf):optional():build() do
+			seen[entity] = { model }
+		end
+		expect(seen).to.equal { [child] = { "p" }, [own] = { "p" }, [root] = {} }
+
+		seen = {}
+		for entity, model in world.query_build():with(Tag):term(Model):up(ecs.ChildOf):self():build() do
+			seen[entity] = model
+		end
+		expect(seen).to.equal { [child] = "p", [own] = "own" }
+
+		local disabled_parent = world.entity()
+		local disabled_child = world.entity()
+		world.add(disabled_parent, Disabled)
+		world.add(disabled_child, ecs.pair(ecs.ChildOf, disabled_parent))
+		world.add(disabled_child, Tag)
+
+		expect(sorted(entities_of(world.query_build():with(Tag):without(Disabled):up(ecs.ChildOf):build()))).to.equal(
+			sorted { child, own, root }
+		)
+		expect(entities_of(world.query_build():with(Tag):with(Disabled):up(ecs.ChildOf):build())).to.equal {
+			disabled_child,
+		}
+	end)
+
+	CASE("up terminates on relation cycles", function()
+		local world = ecs.world()
+		local R = world.tag()
+		local Model = world.component()
+		local Tag = world.tag()
+		local a = world.entity()
+		local b = world.entity()
+		world.add(a, ecs.pair(R, b))
+		world.add(b, ecs.pair(R, a))
+		world.add(a, Tag)
+		world.add(b, Tag)
+
+		expect(entities_of(world.query_build():with(Tag):term(Model):up(R):build())).to.equal {}
+
+		local seen = {}
+		for entity, model in world.query_build():with(Tag):term(Model):up(R):optional():build() do
+			seen[entity] = { model }
+		end
+		expect(seen).to.equal { [a] = {}, [b] = {} }
+	end)
+
+	CASE("deleting the yielded entity mid-iteration is safe with a program", function()
+		local world = ecs.world()
+		local Model = world.component()
+		local parent = world.entity()
+		world.set(parent, Model, "p")
+		local expected = {}
+		for _ = 1, 20 do
+			local child = world.entity()
+			world.add(child, ecs.pair(ecs.ChildOf, parent))
+			expected[child] = true
+		end
+
+		local seen = {}
+		for entity, model in world.query_build():term(Model):up(ecs.ChildOf):build() do
+			expect(model).to.equal "p"
+			expect(seen[entity]).to.beNil()
+			seen[entity] = true
+			world.delete(entity)
+		end
+		expect(seen).to.equal(expected)
+	end)
+
+	CASE("target variables bind once per pair and can be read back", function()
+		local world = ecs.world()
+		local Located = world.component()
+		local Foo = world.component()
+		local room1 = world.entity()
+		local room2 = world.entity()
+		local room3 = world.entity()
+		world.set(room1, Foo, "foo1")
+		world.set(room2, Foo, "foo2")
+		local e = world.entity()
+		local single = world.entity()
+		world.set(e, ecs.pair(Located, room1), 1)
+		world.set(e, ecs.pair(Located, room2), 2)
+		world.set(single, ecs.pair(Located, room3), 3)
+
+		local query = world.query_build():term(Located):target("$room"):build()
+		local results = {}
+		for entity, value in query do
+			table.insert(results, { entity, value, query:var "$room" })
+		end
+		table.sort(results, function(x, y)
+			return x[2] < y[2]
+		end)
+		expect(results).to.equal { { e, 1, room1 }, { e, 2, room2 }, { single, 3, room3 } }
+
+		-- reading a component from the bound variable
+		local sourced = world.query_build():term(Located):target("$room"):term(Foo):from("$room"):build()
+		results = {}
+		for entity, value, foo in sourced do
+			table.insert(results, { entity, value, foo })
+		end
+		table.sort(results, function(x, y)
+			return x[2] < y[2]
+		end)
+		expect(results).to.equal { { e, 1, "foo1" }, { e, 2, "foo2" } }
+
+		local optional = world.query_build():term(Located):target("$room"):term(Foo):from("$room"):optional():build()
+		results = {}
+		for entity, value, foo in optional do
+			table.insert(results, { entity, value, foo })
+		end
+		expect(#results).to.equal(3)
+
+		-- deleting a target drops its pair
+		world.delete(room2)
+		results = {}
+		for entity, value in query do
+			table.insert(results, { entity, value })
+		end
+		table.sort(results, function(x, y)
+			return x[2] < y[2]
+		end)
+		expect(results).to.equal { { e, 1 }, { single, 3 } }
+	end)
+
+	CASE("a variable bound twice is checked against the same target", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local B = world.tag()
+		local t1 = world.entity()
+		local t2 = world.entity()
+		local both = world.entity()
+		local one = world.entity()
+		world.add(both, ecs.pair(A, t1))
+		world.add(both, ecs.pair(B, t1))
+		world.add(one, ecs.pair(A, t2))
+		world.add(one, ecs.pair(B, t1))
+
+		local query = world.query_build():with(A):target("$v"):with(B):target("$v"):build()
+		local results = {}
+		for entity in query do
+			table.insert(results, { entity, query:var "$v" })
+		end
+		expect(results).to.equal { { both, t1 } }
+	end)
+
+	CASE("an unbound source scans every entity holding the component", function()
+		local world = ecs.world()
+		local A = world.component()
+		local B = world.component()
+		local a1 = world.entity()
+		local a2 = world.entity()
+		world.set(a1, A, "a1")
+		world.set(a2, A, "a2")
+		local b1 = world.entity()
+		local b2 = world.entity()
+		local b3 = world.entity()
+		world.set(b1, B, "b1")
+		world.set(b2, B, "b2")
+		world.set(b3, B, "b3")
+		world.set(b3, A, "a3")
+
+		local names = { [b1] = "b1", [b2] = "b2", [b3] = "b3" }
+		local query = world.query_build():term(A):term(B):from("$v"):build()
+		local results = {}
+		for _, a, b in query do
+			table.insert(results, a .. ":" .. b .. ":" .. names[query:var "$v"])
+		end
+		table.sort(results)
+		expect(results).to.equal {
+			"a1:b1:b1",
+			"a1:b2:b2",
+			"a1:b3:b3",
+			"a2:b1:b1",
+			"a2:b2:b2",
+			"a2:b3:b3",
+			"a3:b1:b1",
+			"a3:b2:b2",
+			"a3:b3:b3",
+		}
+	end)
+
+	CASE("reverse lookups yield one result per child", function()
+		local world = ecs.world()
+		local Parent = world.tag()
+		local p1 = world.entity()
+		local p2 = world.entity()
+		local childless = world.entity()
+		world.add(p1, Parent)
+		world.add(p2, Parent)
+		world.add(childless, Parent)
+		local c1 = world.entity()
+		local c2 = world.entity()
+		local c3 = world.entity()
+		world.add(c1, ecs.pair(ecs.ChildOf, p1))
+		world.add(c2, ecs.pair(ecs.ChildOf, p1))
+		world.add(c3, ecs.pair(ecs.ChildOf, p2))
+
+		local query = world.query_build():with(Parent):with(ecs.ChildOf):from("$child"):target("$this"):build()
+		local results = {}
+		for entity in query do
+			table.insert(results, { entity, query:var "$child" })
+		end
+		table.sort(results, function(x, y)
+			return x[2] < y[2]
+		end)
+		expect(results).to.equal { { p1, c1 }, { p1, c2 }, { p2, c3 } }
+	end)
+
+	CASE("bor picks the first present alternative", function()
+		local world = ecs.world()
+		local A = world.component()
+		local B = world.component()
+		local C = world.component()
+		local Tag = world.tag()
+		local a = world.entity()
+		local b = world.entity()
+		local ab = world.entity()
+		local c = world.entity()
+		local none = world.entity()
+		world.set(a, A, "a")
+		world.set(b, B, "b")
+		world.set(ab, A, "ab-a")
+		world.set(ab, B, "ab-b")
+		world.set(c, C, "c")
+		for _, e in { a, b, ab, c, none } do
+			world.add(e, Tag)
+		end
+
+		local seen = {}
+		for entity, value in world.query_build():with(Tag):term(A):bor():term(B):build() do
+			seen[entity] = value
+		end
+		expect(seen).to.equal { [a] = "a", [b] = "b", [ab] = "ab-a" }
+
+		seen = {}
+		for entity, value in world.query_build():with(Tag):term(A):bor():term(B):bor():term(C):build() do
+			seen[entity] = value
+		end
+		expect(seen).to.equal { [a] = "a", [b] = "b", [ab] = "ab-a", [c] = "c" }
+
+		seen = {}
+		for entity, value in world.query_build():with(Tag):term(A):bor():term(B):optional():build() do
+			seen[entity] = { value }
+		end
+		expect(seen).to.equal { [a] = { "a" }, [b] = { "b" }, [ab] = { "ab-a" }, [c] = {}, [none] = {} }
+
+		expect(sorted(entities_of(world.query_build():with(Tag):with(A):bor():with(C):build()))).to.equal(
+			sorted { a, ab, c }
+		)
+	end)
+
+	CASE("bor can mix self and inherited terms", function()
+		local world = ecs.world()
+		local Model = world.component()
+		local Tag = world.tag()
+		local parent = world.entity()
+		local child = world.entity()
+		local own = world.entity()
+		local root = world.entity()
+		world.set(parent, Model, "p")
+		world.set(own, Model, "own")
+		world.add(child, ecs.pair(ecs.ChildOf, parent))
+		for _, e in { child, own, root } do
+			world.add(e, Tag)
+		end
+
+		local seen = {}
+		for entity, model in world.query_build():with(Tag):term(Model):bor():term(Model):up(ecs.ChildOf):build() do
+			seen[entity] = model
+		end
+		expect(seen).to.equal { [child] = "p", [own] = "own" }
+	end)
+
+	CASE("cached queries follow archetype creation and destruction", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local B = world.tag()
+		local e1 = world.entity()
+		world.add(e1, A)
+
+		local observers_before = #(world.internal.archetype_creation_observers[A] or {})
+		local query = world.query_build():with(A):build():cached()
+		expect(query.is_cached).to.equal(true)
+		expect(query:cached()).to.equal(query)
+		expect(#query:archetypes()).to.equal(1)
+
+		local e2 = world.entity()
+		world.bulk_add(e2, { A, B })
+		expect(#query:archetypes()).to.equal(2)
+		expect(sorted(entities_of(query))).to.equal(sorted { e1, e2 })
+		expect(query:match(world.internal.get_entity_record(e2).archetype)).to.equal(true)
+
+		-- deleting B destroys the { A, B } archetype and moves e2 into { A }
+		world.delete(B)
+		expect(#query:archetypes()).to.equal(1)
+		expect(sorted(entities_of(query))).to.equal(sorted { e1, e2 })
+
+		query:cleanup()
+		expect(query.is_cached).to.equal(false)
+		expect(#(world.internal.archetype_creation_observers[A] or {})).to.equal(observers_before)
+	end)
+
+	CASE("transitive relations match through a chain of pairs", function()
+		local world = ecs.world()
+		local LocatedIn = world.tag()
+		local Contains = world.component()
+		local Tag = world.tag()
+		world.add(LocatedIn, ecs.Transitive)
+		expect(world.get(ecs.Transitive, ecs.Name)).to.equal "ecs.Transitive"
+
+		local earth = world.entity()
+		local country = world.entity()
+		local city = world.entity()
+		local house = world.entity()
+		local mars = world.entity()
+		world.add(country, ecs.pair(LocatedIn, earth))
+		world.add(city, ecs.pair(LocatedIn, country))
+		world.add(house, ecs.pair(LocatedIn, city))
+		world.set(country, ecs.pair(Contains, earth), "c")
+		world.set(city, ecs.pair(Contains, country), "ci")
+		world.set(house, ecs.pair(Contains, city), "h")
+		for _, e in { earth, country, city, house, mars } do
+			world.add(e, Tag)
+		end
+
+		-- relation carries the trait: transitive without asking
+		local auto = world.query_build():with(Tag):with(LocatedIn):target(earth):build()
+		expect(auto.is_static).to.equal(false)
+		expect(sorted(entities_of(auto))).to.equal(sorted { country, city, house })
+		expect(sorted(entities_of(world.query_build():with(Tag):with(ecs.pair(LocatedIn, earth)):build()))).to.equal(
+			sorted { country, city, house }
+		)
+		expect(sorted(entities_of(world.query_build():with(Tag):without(LocatedIn):target(earth):build()))).to.equal(
+			sorted { earth, mars }
+		)
+
+		-- relation without the trait: opt in per term, direct match otherwise
+		expect(entities_of(world.query_build():with(Tag):with(Contains):target(earth):build())).to.equal { country }
+		local manual = world.query_build():with(Tag):term(Contains):target(earth):transitive():build()
+		local seen = {}
+		for entity, value in manual do
+			seen[entity] = value
+		end
+		expect(seen).to.equal { [country] = "c", [city] = "c", [house] = "c" }
+	end)
+
+	CASE("builder and compile errors", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local B = world.tag()
+		local R = world.tag()
+		local T = world.entity()
+
+		expect(function()
+			world.query_build():term(A):transitive():build()
+		end).to.throw "needs a pair term"
+		expect(function()
+			world.query_build():term(R):target("$v"):transitive():build()
+		end).to.throw "not supported yet"
+		expect(function()
+			world.query_build():term(R):target(T):up(R):transitive()
+		end).to.throw ":transitive()"
+
+		expect(function()
+			world.query_build():optional()
+		end).to.throw "without a term"
+		expect(function()
+			world.query_build():without(A):bor()
+		end).to.throw ":bor()"
+		expect(function()
+			world.query_build():term(A):bor():without(B)
+		end).to.throw ":bor()"
+		expect(function()
+			world.query_build():term(A):bor():build()
+		end).to.throw "must be followed by a term"
+		expect(function()
+			world.query_build():term(ecs.pair(R, T)):target(T)
+		end).to.throw "pair id"
+		expect(function()
+			world.query_build():term(A):up(ecs.pair(R, T))
+		end).to.throw "relation"
+		expect(function()
+			world.query_build():term(A):self()
+		end).to.throw "requires :up()"
+		expect(function()
+			world.query_build():term(A):from("$v"):build()
+		end).to.throw "required term on $this"
+		expect(function()
+			world.query_build():with(A):without(R):target("$v"):build()
+		end).to.throw "never bound"
+		expect(function()
+			world.query_build():term(A):target "v"
+		end).to.throw "$variable"
+	end)
+end)
+
 local report = testlib.run(plan)
 testlib.report(report)
 

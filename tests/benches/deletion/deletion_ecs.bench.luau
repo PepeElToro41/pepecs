@@ -1,128 +1,61 @@
-local ServerScriptService = game:GetService "ServerScriptService"
+--!optimize 2
+--!native
 
-local ecs = require(ServerScriptService.ecs.ecs)
+local bench = require "../bench"
+local ecs = require "../../../src/"
 
-if game then
-	ecs = require(ServerScriptService.ecs.ecs:Clone()) :: typeof(ecs)
+local N = 2 ^ 15
+
+local world = ecs.world()
+local C = {}
+for i = 1, 32 do
+	C[i] = world.component()
 end
+local Rel = {}
+for i = 1, 4 do
+	Rel[i] = world.entity()
+end
+local target = world.entity()
 
-local CHILD_AMOUNT = 50
-local ARCHETYPE_SIZE = 20
-local ARCHETYPE_COUNT = 50
-
-local function ecs_create_components(world: ecs.World)
-	local components: { ecs.Component } = {}
-
-	for i = 1, ARCHETYPE_SIZE + ARCHETYPE_COUNT do
-		components[i] = world.component()
+local function make(count: number, pairs_count: number?): { ecs.Entity }
+	local list = {}
+	for i = 1, N do
+		local e = world.entity()
+		for c = 1, count do
+			world.set(e, C[c], c)
+		end
+		for p = 1, pairs_count or 0 do
+			world.add(e, ecs.pair(Rel[p], target))
+		end
+		list[i] = e
 	end
-	return components
+	return list
 end
 
-local function ecs_create_children(world: ecs.World, components: { ecs.Component })
-	local children: { ecs.Entity } = {}
+bench.title "deletion: plain delete (no cleanup traits)"
 
-	for a = 0, ARCHETYPE_COUNT - 1 do
-		for i = 1, CHILD_AMOUNT do
-			local child = world.entity()
-			children[1] = child
+local empty = make(0)
+bench.run("delete empty entity", N, function(i)
+	world.delete(empty[i])
+end)
 
-			local adding: { ecs.Component } = {}
-			local values: { any } = {}
+local with8 = make(8)
+bench.run("delete entity with 8 components", N, function(i)
+	world.delete(with8[i])
+end)
 
-			for c = 1, ARCHETYPE_SIZE do
-				table.insert(adding, components[c + a])
-				table.insert(values, `value{c + a}`)
-			end
+local with32 = make(32)
+bench.run("delete entity with 32 components", N, function(i)
+	world.delete(with32[i])
+end)
 
-			world.bulk_set(child, adding, values)
-		end
-	end
+local with_pairs = make(4, 4)
+bench.run("delete entity with 4 components + 4 pairs", N, function(i)
+	world.delete(with_pairs[i])
+end)
 
-	return children
-end
-
--- ecs
-local ecs_benches = {
-	on_delete_target_delete = function()
-		local world = ecs.world()
-		local components = ecs_create_components(world)
-		local children = ecs_create_children(world, components)
-
-		local rel = world.entity()
-		world.add(rel, ecs.pair(ecs.OnDeleteTarget, ecs.Delete))
-
-		local parent = world.entity()
-
-		for _, child in children do
-			world.add(child, ecs.pair(rel, parent))
-		end
-
-		return world, parent
-	end,
-
-	on_delete_target_remove = function()
-		local world = ecs.world()
-		local components = ecs_create_components(world)
-		local children = ecs_create_children(world, components)
-
-		local rel = world.entity()
-
-		local parent = world.entity()
-
-		for _, child in children do
-			world.add(child, ecs.pair(rel, parent))
-		end
-
-		return world, parent
-	end,
-
-	on_delete_delete = function()
-		local world = ecs.world()
-		local components = ecs_create_components(world)
-		local children = ecs_create_children(world, components)
-
-		local parent = world.entity()
-		world.add(parent, ecs.pair(ecs.OnDelete, ecs.Delete))
-
-		for _, child in children do
-			world.add(child, parent)
-		end
-
-		return world, parent
-	end,
-
-	on_delete_remove = function()
-		local world = ecs.world()
-		local components = ecs_create_components(world)
-		local children = ecs_create_children(world, components)
-
-		local parent = world.entity()
-
-		for _, child in children do
-			world.add(child, parent)
-		end
-
-		return world, parent
-	end,
-}
-
-return {
-	ParameterGenerator = function(key: string)
-		return ecs_benches[key]()
-	end,
-	Functions = {
-		on_delete_target_delete = function(profiler, world: ecs.World, parent: ecs.Entity)
-			world.delete(parent)
-		end,
-		on_delete_target_remove = function(profiler, world: ecs.World, parent: ecs.Entity)
-			world.delete(parent)
-		end,
-		on_delete_delete = function(profiler, world: ecs.World, parent: ecs.Entity)
-			world.delete(parent)
-		end,
-		on_delete_remove = function(profiler, world: ecs.World, parent: ecs.Entity)
-			world.delete(parent)
-		end,
-	},
-}
+-- delete from the back so every delete is a pop, not a swap-remove
+local from_back = make(8)
+bench.run("delete 8-wide entity, back to front", N, function(i)
+	world.delete(from_back[N - i + 1])
+end)

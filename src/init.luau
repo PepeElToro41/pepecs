@@ -2,6 +2,8 @@
 --!native
 --!strict
 
+local engine = require "@self/engine"
+
 type u24 = number
 type u53 = number
 type ArchetypeId = number
@@ -253,6 +255,21 @@ export type WorldInternal = {
 		without_ids: { number }?,
 		ignore_empty: boolean
 	) -> { Archetype },
+	OBSERVE_MATCHED_ARCHETYPES: (
+		world: World,
+		with_ids: { number },
+		without_ids: { number }?
+	) -> ({ Archetype }, Map<ArchetypeId, number>, Cleanup),
+
+	get_archetypes_count: () -> number,
+
+	ECS_PAIR: (first: u53, second: u53) -> u53,
+	PAIR_FIRST: (id: u53) -> u24,
+	PAIR_SECOND: (id: u53) -> u24,
+	IS_PAIR: (id: u53) -> boolean,
+	ECS_WILDCARD: u53,
+	ECS_TRANSITIVE: u53,
+	NULL_ARRAY: { any },
 }
 
 export type World = {
@@ -355,7 +372,7 @@ export type World = {
 	is_tag: (Id) -> boolean,
 
 	each: (id: Component) -> () -> Entity,
-	query_build: () -> QueryBuilder,
+	query_build: () -> engine.QueryBuilder,
 	query: (() -> Query<nil>)
 		& (<A>(Component<A>) -> Query<A>)
 		& (<A, B>(Component<A>, Component<B>) -> Query<A, B>)
@@ -427,7 +444,8 @@ local ECS_ERROR = 			   MAX_COMPONENT_ID +  9
 local ECS_TRAVERSABLE = 	   MAX_COMPONENT_ID + 10
 local ECS_DISABLED = 		   MAX_COMPONENT_ID + 11
 local ECS_FORCE_TAG = 	   MAX_COMPONENT_ID + 12
-local ECS_REST = 			   MAX_COMPONENT_ID + 13
+local ECS_TRANSITIVE = 	   MAX_COMPONENT_ID + 13
+local ECS_REST = 			   MAX_COMPONENT_ID + 14
 -- stylua: ignore end
 
 local IS_COMPONENT_FLAG = bit32.lshift(1, 0)
@@ -2598,497 +2616,6 @@ query_mt.columns = query_columns
 query_mt.monitor = query_monitor
 query_mt.observe = query_observe
 query_mt.changed = query_changed
-
-export type QueryEngine<T...> = {}
-
-type ArchetypeMatcher = {
-	with_ids: Array<u53>,
-	without_ids: Array<u53>,
-}
-
-export type QueryEngineInternal = QueryEngine<any> & {
-	world: World,
-	invalidated: boolean,
-	descriptor: QueryDescriptor,
-	compiled: boolean,
-
-	base_matcher: ArchetypeMatcher,
-
-	trivial_outputs: Array<u53 | false>,
-	match_program: ProgramPreprocess,
-	outer_program: ProgramPreprocess,
-	inner_program: ProgramPreprocess,
-
-	valid_archetypes: Array<Archetype>,
-	invalid_archetypes: Array<Archetype>,
-}
-
-export type QueryBuilder = {
-	term: (self: QueryBuilder, component: Entity) -> QueryBuilder,
-	with: (self: QueryBuilder, component: Entity) -> QueryBuilder,
-	without: (self: QueryBuilder, component: Entity) -> QueryBuilder,
-
-	transitive: (self: QueryBuilder) -> QueryBuilder,
-	optional: (self: QueryBuilder) -> QueryBuilder,
-	bor: (self: QueryBuilder) -> QueryBuilder,
-	wildcard: (self: QueryBuilder) -> QueryBuilder,
-	target: (self: QueryBuilder, target: Entity | string) -> QueryBuilder,
-	from: (self: QueryBuilder, source: Entity | string) -> QueryBuilder,
-
-	up: (self: QueryBuilder, relation: Entity, var: string?) -> QueryBuilder,
-	self: (self: QueryBuilder) -> (),
-
-	build: (self: QueryBuilder) -> QueryEngine<...any>,
-}
-
-export type QueryBuilderInternal = QueryBuilder & {
-	world: World,
-	pending: Term?,
-	pending_or: Term?,
-	descriptor: QueryDescriptor,
-}
-
-type InstructionEntry = {
-	disabled: boolean,
-	instruction: Instruction,
-}
-
-type ProgramPreprocess = {
-	instructions: { InstructionEntry },
-}
-
-type Instruction = { any }
-type Bytecode = { Instruction }
-type OPCode = number
-
-type Term = {
-	term_output: number?,
-	optional: boolean,
-	ored: Term?,
-	negated: boolean,
-	transitive: boolean,
-
-	id: u53,
-	self: boolean,
-	source: string?,
-	target: (u53 | string)?,
-	traversal: u53?,
-	traversal_var: string?,
-}
-
-export type QueryDescriptor = {
-	total_outputs: number,
-	terms: { Term },
-}
-
-local OP_JMP_TAG = 0
-local OP_MATCH_ARCH = 1
-local OP_OUT_TERM = 2
-local OP_CLR_TERM = 3
-local OP_PUSH_VAR_REL = 5
-local OP_PUSH_TARGET_ARCH = 5
-local OP_TRAV_OUT = 7
-local OP_TRAV_SELF_OUT = 7
-local OP_TRAV_ID = 6
-local OP_TRAV_SELF_ID = 7
-local OP_MATCH_ID = 7
-local OP_JMP = 8
-local OP_JMP_TRUE = 9
-local OP_JMP_FALSE = 10
-local OP_EMIT = 11
-local OP_EXIT = 12
-
-local query_engine_mt = {}
-
-local function create_program(): ProgramPreprocess
-	return {
-		instructions = {},
-	}
-end
-local function term_is_required(term: Term)
-	local skip = term.negated or term.optional or term.ored
-	return not skip
-end
-local function term_is_excluded(term: Term)
-	local skip = term.optional or term.ored
-	return term.negated and not skip
-end
-
-local function OP_CODE(program: ProgramPreprocess, op: OPCode, ...)
-	table.insert(program.instructions, {
-		disabled = false,
-		instruction = { op, ... },
-	})
-end
-
---[[
-	UP
-	JUMPTRUE skip
-	TRAV
-	JUMPTRUE skip
-	EXIT
-	:skip
-
-]]
-
--- TODO:
--- transitive should accept query vars
--- transitive should output variables
--- traversable should output variables
--- traversable ids should accept query vars
--- non-compiled queries should not initialize programs
--- add "maybe" trivial outputs
--- transitive/traversal should accept optional
-
-local function query_engine_rematch(query: QueryEngineInternal) end
-
-local function query_engine_compile(query: QueryEngineInternal)
-	local descriptor = query.descriptor
-	local with_ids = query.base_matcher.with_ids
-	local without_ids = query.base_matcher.without_ids
-
-	local trivial_outputs = query.trivial_outputs
-	local match_program = query.match_program
-	local outer_program = query.outer_program
-	local inner_program = query.inner_program
-
-	local query_variables: Map<string, {
-		terms: { Term },
-		var_index: number,
-		matcher: ArchetypeMatcher,
-	}> = {}
-
-	local block_jump_index = 0
-	local current_var_index = 0
-	local ored: Term? = nil
-	local compile_term: (term: Term) -> ()
-
-	local function term_is_required(term: Term)
-		if ored then
-			return false
-		end
-		local skip = term.negated or term.optional or term.ored
-		return not skip
-	end
-
-	local function term_is_excluded(term: Term)
-		if ored then
-			return false
-		end
-		local skip = term.ored or term.optional
-		return term.negated and not skip
-	end
-
-	local function compile_ored(ored_term: Term)
-		local current_ored = ored
-		ored = ored_term
-		compile_term(ored_term)
-		ored = current_ored
-	end
-
-	local function block_start(term: Term)
-		if not ored then
-			block_jump_index += 1
-		end
-		if term.negated then
-			OP_CODE(match_program, OP_JMP_FALSE, `skip{block_jump_index}`)
-		else
-			OP_CODE(match_program, OP_JMP_TRUE, `skip{block_jump_index}`)
-		end
-	end
-
-	local function block_end()
-		if ored then
-			return
-		end
-		OP_CODE(match_program, OP_EXIT)
-		OP_CODE(match_program, OP_JMP_TAG, `skip{block_jump_index}`)
-	end
-
-	local function compile_block(term: Term)
-		block_start(term)
-		local ored_term = term.ored
-		if ored_term then
-			compile_ored(ored_term)
-		end
-		block_end()
-	end
-
-	local function get_query_var(var_name: string)
-		local variable = query_variables[var_name]
-		if not variable then
-			current_var_index += 1
-			local matcher = { with_ids = {} } :: ArchetypeMatcher
-			local new_variable = {
-				terms = {},
-				var_index = current_var_index,
-				matcher = matcher,
-			}
-			query_variables[var_name] = new_variable
-			return new_variable
-		end
-		return variable
-	end
-
-	local function compile_traversal(term: Term, relation: u53, id: u53)
-		if term_is_required(term) and not term.self then
-			local wildcard = ECS_PAIR(relation, ECS_WILDCARD)
-			table.insert(with_ids, wildcard)
-		end
-
-		if term.target then
-			if typeof(term.target) == "number" then
-				id = ECS_PAIR(id, term.target)
-			else
-				error "query variables are not supported in transitive/traversal terms"
-			end
-		end
-
-		local op_code = term.self and OP_TRAV_SELF_ID or OP_TRAV_ID
-		OP_CODE(match_program, op_code, term.traversal, term.id)
-		compile_block(term)
-
-		if term.term_output then
-			local out_op_code = term.self and OP_TRAV_SELF_OUT or OP_TRAV_OUT
-			OP_CODE(outer_program, out_op_code, term.term_output, relation, term.id)
-		end
-	end
-
-	function compile_term(term: Term)
-		if term.transitive then
-			local rel = term.id
-			if not term.target then
-				rel = PAIR_FIRST(term.id)
-			end
-
-			compile_traversal(term, rel, term.id)
-		elseif term.traversal then
-			compile_traversal(term, term.traversal, term.id)
-		elseif term.target then
-			local second = term.target
-			if type(second) == "number" then
-				local pair = ECS_PAIR(term.id, second)
-				if term_is_required(term) then
-					table.insert(with_ids, pair)
-					if term.term_output then
-						trivial_outputs[term.term_output] = term.id
-					end
-				elseif term_is_excluded(term) then
-					table.insert(without_ids, pair)
-				else
-					-- TODO: check for optionals
-					OP_CODE(match_program, OP_MATCH_ID, pair)
-					compile_block(term)
-				end
-			else
-				if not term_is_required(term) then
-					error "query variables cannot be negated/ored/optional"
-				end
-
-				local variable = get_query_var(second)
-				local wildcard = ECS_PAIR(PAIR_FIRST(term.id), ECS_WILDCARD)
-				table.insert(with_ids, wildcard)
-				table.insert(variable.terms, term)
-			end
-		else
-			if term.source then
-				if term_is_required(term) then
-					table.insert(with_ids, term.id)
-				elseif term_is_excluded(term) then
-					table.insert(without_ids, term.id)
-				else
-					-- TODO: check for optionals
-					-- TODO: add query vars
-					OP_CODE(match_program, OP_MATCH_ID, term.id)
-					compile_block(term)
-				end
-			else
-				if term_is_required(term) then
-					table.insert(with_ids, term.id)
-				elseif term_is_excluded(term) then
-					table.insert(without_ids, term.id)
-				else
-					-- TODO: check for optionals
-					-- TODO: add query vars
-					OP_CODE(match_program, OP_MATCH_ID, term.id)
-					compile_block(term)
-				end
-			end
-		end
-	end
-
-	for _, term in descriptor.terms do
-		compile_term(term)
-	end
-
-	query.compiled = true
-	query.invalidated = true
-	return query
-end
-
-local function query_engine_new(world: World, descriptor: QueryDescriptor)
-	local query = {} :: QueryEngineInternal
-
-	query.world = world
-	query.descriptor = descriptor
-	query.compiled = false
-	query.invalidated = true
-	query.trivial_outputs = table.create(query.descriptor.total_outputs, false) :: {}
-
-	query.match_program = create_program()
-	query.outer_program = create_program()
-	query.inner_program = create_program()
-
-	query.base_matcher = {
-		with_ids = {},
-		without_ids = {},
-	}
-
-	query.valid_archetypes = {}
-	query.invalid_archetypes = {}
-	return query
-end
-
-local function apply_queued_term(builder: QueryBuilderInternal)
-	local term = builder.pending
-	if term then
-		table.insert(builder.descriptor.terms, term)
-		builder.pending = nil
-	end
-end
-
-local function queue_new_term(builder: QueryBuilderInternal, id: u53)
-	local new_term: Term = {
-		id = id,
-		optional = false,
-		transitive = false,
-		negated = false,
-		self = false,
-	}
-
-	if builder.pending_or then
-		builder.pending_or.ored = new_term
-		builder.pending_or = nil
-	end
-
-	return new_term
-end
-
-function query_builder_term(builder: QueryBuilderInternal, id: u53): QueryBuilder
-	apply_queued_term(builder)
-	local new_term = queue_new_term(builder, id)
-	builder.descriptor.total_outputs += 1
-	new_term.term_output = builder.descriptor.total_outputs
-	return builder
-end
-
-function query_builder_with(builder: QueryBuilderInternal, id: u53): QueryBuilder
-	apply_queued_term(builder)
-	queue_new_term(builder, id)
-	return builder
-end
-
--- :without(comp) — add a negated filter term. Commits pending terms first.
-function query_builder_without(builder: QueryBuilderInternal, id: u53): QueryBuilder
-	apply_queued_term(builder)
-	local new_term = queue_new_term(builder, id)
-	new_term.negated = true
-	return builder
-end
-
-function query_builder_optional(builder: QueryBuilderInternal): QueryBuilder
-	local term = builder.pending
-	if not term then
-		return error "Cannot call :optional() without a term"
-	end
-	term.optional = true
-	return builder
-end
-
--- TODO: set builder.pending_or
-function query_builder_bor(builder: QueryBuilderInternal): QueryBuilder
-	local term = builder.pending
-	if not term then
-		return error "Cannot call :bor() without a term"
-	end
-	builder.pending_or = term
-	return builder
-end
-
--- :wildcard() — set the target slot of the current term to WILDCARD,
--- turning it into a pair match like (rel, *).
-function query_builder_wildcard(builder: QueryBuilderInternal): QueryBuilder
-	local term = builder.pending
-	if not term then
-		return error "Cannot call :wildcard() without a term"
-	end
-	term.target = ECS_WILDCARD
-	return builder
-end
-
--- :target(entity | "$var") — constrain the relationship target of the current term.
-function query_builder_target(builder: QueryBuilderInternal, target: u53 | string): QueryBuilder
-	local term = builder.pending
-	if not term then
-		return error "Cannot call :target() without a term"
-	end
-	term.target = target
-	return builder
-end
-
-function query_builder_from(builder: QueryBuilderInternal, source: string): QueryBuilder
-	local term = builder.pending
-	if not term then
-		return error "Cannot call :from() without a term"
-	end
-	term.source = source
-	return builder
-end
-
--- :up(relation) — traverse upwards along the given relation to find the component.
-function query_builder_up(builder: QueryBuilderInternal, relation: u53): QueryBuilder
-	local term = builder.pending
-	if not term then
-		return error "Cannot call :up() without a term"
-	end
-	term.traversal = relation
-	return builder
-end
-
--- :build() — commit remaining pending terms and return the Query.
-function query_builder_build(builder: QueryBuilderInternal): QueryEngine<...any>
-	apply_queued_term(builder)
-	return query_engine_new(builder.world, builder.descriptor)
-end
-
-local query_builder_mt = {}
-
-query_builder_mt.term = query_builder_term
-query_builder_mt.with = query_builder_with
-query_builder_mt.without = query_builder_without
-query_builder_mt.optional = query_builder_optional
-query_builder_mt.bor = query_builder_bor
-query_builder_mt.wildcard = query_builder_wildcard
-query_builder_mt.target = query_builder_target
-query_builder_mt.from = query_builder_from
-query_builder_mt.up = query_builder_up
-query_builder_mt.build = query_builder_build
-
-local function query_build(world: World)
-	local descriptor: QueryDescriptor = {
-		terms = {},
-		with = {},
-		total_outputs = 0,
-	}
-
-	local builder = {} :: QueryBuilderInternal
-	builder.world = world
-	builder.pending = nil
-	builder.pending_or = nil
-	builder.descriptor = descriptor
-
-	return setmetatable(builder, query_builder_mt)
-end
 
 local function world_new()
 	local dense_arr = {}
@@ -5375,6 +4902,18 @@ local function world_new()
 		INSERT_COMPONENT_HOOK = INSERT_COMPONENT_HOOK,
 		MATCH_ARCHETYPE = MATCH_ARCHETYPE,
 		FIND_MATCHED_ARCHETYPES = FIND_MATCHED_ARCHETYPES,
+		OBSERVE_MATCHED_ARCHETYPES = OBSERVE_MATCHED_ARCHETYPES,
+		get_archetypes_count = function()
+			return archetypes_count
+		end,
+
+		ECS_PAIR = ECS_PAIR,
+		PAIR_FIRST = PAIR_FIRST,
+		PAIR_SECOND = PAIR_SECOND,
+		IS_PAIR = IS_PAIR,
+		ECS_WILDCARD = ECS_WILDCARD,
+		ECS_TRANSITIVE = ECS_TRANSITIVE,
+		NULL_ARRAY = NULL_ARRAY,
 	}
 
 	local world: World = {
@@ -5491,7 +5030,7 @@ local function world_new()
 	end
 
 	local function world_query_build()
-		return query_build(world)
+		return engine.build(world)
 	end
 
 	world.each = world_each :: any
@@ -5523,6 +5062,7 @@ local function world_new()
 	world_set(ECS_DELETE, ECS_NAME, "ecs.Delete")
 	world_set(ECS_NAME, ECS_NAME, "ecs.Name")
 	world_set(ECS_REST, ECS_NAME, "ecs.Rest")
+	world_set(ECS_TRANSITIVE, ECS_NAME, "ecs.Transitive")
 
 	world_add(ECS_CHILDOF, ECS_EXCLUSIVE)
 	world_add(ECS_CHILDOF, ECS_PAIR(ECS_ON_DELETE_TARGET, ECS_DELETE))
@@ -5571,6 +5111,7 @@ return {
 	ForceTag = ANY(ECS_FORCE_TAG) :: Entity,
 	Error = ANY(ECS_ERROR) :: Entity,
 	Traversable = ANY(ECS_TRAVERSABLE) :: Entity,
+	Transitive = ANY(ECS_TRANSITIVE) :: Entity,
 	Disabled = ANY(ECS_DISABLED) :: Entity,
 
 	world = world_new,
