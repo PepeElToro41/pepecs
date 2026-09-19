@@ -68,6 +68,14 @@ type Prematcher = {
 	find: (ignore_empty: boolean) -> { Archetype },
 }
 
+-- An id another entity provides to `$this`. When `id` changes on entity X the
+-- archetypes holding `(relation, X)` are re-evaluated, recursively for `up`.
+type DependencyWatch = {
+	id: u53,
+	relation: u53,
+	recursive: boolean,
+}
+
 type QueryInternal = {
 	world: World,
 	is_static: boolean,
@@ -81,6 +89,14 @@ type QueryInternal = {
 	var_names: { string },
 	yield_fail_pc: number,
 	cacheable_results: boolean,
+
+	-- monitor support: true when the program binds `$this` per entity
+	per_entity: boolean,
+	-- `$this` ids that can change validity without leaving the prematched set
+	self_watch: { u53 },
+	dep_watch: { DependencyWatch },
+	-- ids whose change cannot be localised to an archetype
+	global_watch: { u53 },
 
 	is_cached: boolean,
 	compatible_archetypes: { Archetype }?,
@@ -364,6 +380,9 @@ type TermPlan = {
 	needs_each: boolean,
 	ops: { OpRecord },
 	binds: { number },
+	-- relation through which `$this` binds the variables in `binds`, when the
+	-- plan is an OP_TARGET_VAR on `$this`
+	bind_via: u53?,
 }
 
 local function op_record(
@@ -565,6 +584,11 @@ local function compile(builder: BuilderInternal): QueryInternal
 		yield_fail_pc = 0,
 		cacheable_results = true,
 
+		per_entity = false,
+		self_watch = {},
+		dep_watch = {},
+		global_watch = {},
+
 		is_cached = false,
 		compatible_archetypes = nil,
 		compatible_archetypes_map = nil,
@@ -580,6 +604,7 @@ local function compile(builder: BuilderInternal): QueryInternal
 
 	-- 5. plan ops -----------------------------------------------------------
 	local bound: Map<number, boolean> = { [THIS_VAR] = true }
+	local bind_relation: Map<number, u53?> = {}
 	local this_each = false
 
 	local function m_of(var: number): number
@@ -694,6 +719,7 @@ local function compile(builder: BuilderInternal): QueryInternal
 				needs_each = false,
 				ops = { op_record(OP_TARGET_VAR, true, src, term.rid, tgt, term.out, m_of(src)) },
 				binds = { tgt },
+				bind_via = if src == THIS_VAR then term.id else nil,
 			}
 		end
 
@@ -750,6 +776,7 @@ local function compile(builder: BuilderInternal): QueryInternal
 
 		for _, var in plan.binds do
 			bound[var] = true
+			bind_relation[var] = plan.bind_via
 		end
 	end
 
@@ -807,6 +834,77 @@ local function compile(builder: BuilderInternal): QueryInternal
 
 	local yield = op_record(OP_YIELD, false)
 	emit(yield)
+
+	-- 5b. monitor dependencies ----------------------------------------------
+	-- Ids whose change on some entity can flip the validity of a `$this`
+	-- archetype without moving `$this` in or out of the prematched set.
+	local self_watch: { u53 } = {}
+	local dep_watch: { DependencyWatch } = {}
+	local global_watch: { u53 } = {}
+	local self_set: Map<u53, boolean> = {}
+	local dep_set: Map<u53, DependencyWatch> = {}
+	local global_set: Map<u53, boolean> = {}
+
+	local function add_dep(id: u53, relation: u53, recursive: boolean)
+		local existing = dep_set[id]
+		if existing then
+			existing.recursive = existing.recursive or recursive
+			return
+		end
+		local watch: DependencyWatch = { id = id, relation = relation, recursive = recursive }
+		dep_set[id] = watch
+		table.insert(dep_watch, watch)
+	end
+
+	local function add_global(id: u53)
+		if not global_set[id] then
+			global_set[id] = true
+			table.insert(global_watch, id)
+		end
+	end
+
+	for _, head in terms do
+		if head.optional then
+			continue
+		end
+		local alternative: Term? = head
+		while alternative do
+			local term = alternative
+			if term.src_var == THIS_VAR then
+				if term.up then
+					local up: u53 = term.up
+					add_dep(term.rid, up, true)
+					add_dep(term.rel_wc, up, true)
+				elseif term.tgt_var ~= 0 or head.or_next then
+					-- (R, *) swaps keep the entity in the set; bor alternatives are
+					-- not part of the prematcher
+					self_set[term.rid] = true
+				end
+			elseif term.up then
+				add_global(term.rid)
+				add_global(term.rel_wc)
+			else
+				local relation = bind_relation[term.src_var]
+				if relation then
+					add_dep(term.rid, relation, false)
+				else
+					add_global(term.rid)
+				end
+			end
+			alternative = term.or_next
+		end
+	end
+
+	for id in self_set do
+		if not dep_set[id] and not global_set[id] then
+			table.insert(self_watch, id)
+		end
+	end
+
+	query.per_entity = this_each
+	query.self_watch = self_watch
+	query.dep_watch = dep_watch
+	query.global_watch = global_watch
 
 	-- 6. encode -------------------------------------------------------------
 	local code: { number } = table.create(#ops * STRIDE, 0)
@@ -1132,7 +1230,10 @@ local function iter_static(query: QueryInternal, list: { Archetype }): () -> ...
 	end
 end
 
-local function iter_program(query: QueryInternal, list: { Archetype }): () -> ...any
+-- With `probe`, returns `(archetype) -> boolean` instead of an iterator: runs
+-- the program for that single archetype until its first yield. `list` must
+-- then be a private one-slot table.
+local function iter_program(query: QueryInternal, list: { Archetype }, probe: boolean?): () -> ...any
 	local world = query.world
 	local internal = world.internal
 	local components_lookup = world.components_lookup
@@ -1160,8 +1261,6 @@ local function iter_program(query: QueryInternal, list: { Archetype }): () -> ..
 	local res_entities: { Entity } = EMPTY
 	local res_lo = 1
 	local res_hi = 0
-
-	query.last_var_ent = var_ent
 
 	-- Runs the program until the next OP_YIELD. `redo` resumes the last
 	-- iterating op instead of starting from the beginning.
@@ -1404,6 +1503,15 @@ local function iter_program(query: QueryInternal, list: { Archetype }): () -> ..
 			end
 		end
 	end
+
+	if probe then
+		return (function(archetype: Archetype): boolean
+			list[1] = archetype
+			return run(false)
+		end) :: any
+	end
+
+	query.last_var_ent = var_ent
 
 	local cur_row = 0
 	local row_lo = 1
@@ -1719,8 +1827,212 @@ local function query_var(query: QueryInternal, name: string): u53?
 	return var_ent[index]
 end
 
+-- Monitors are event driven: every id the query depends on is hooked and the
+-- affected archetypes are re-probed from inside those hooks. A `reported` set
+-- keeps every `added` balanced by exactly one `removed`, so hooks firing twice
+-- for one operation or callbacks mutating the world are harmless.
+local function query_monitor(query: QueryInternal): types.Monitor
+	local world = query.world
+	local internal = world.internal
+	local prematcher = query.prematcher
+	local without_ids: { u53 }? = if #prematcher.without_ids > 0 then prematcher.without_ids else nil
+
+	if query.is_static then
+		return internal.monitor_new(world, prematcher.with_ids, without_ids)
+	end
+	if query.per_entity then
+		error "monitor() is not supported on queries that bind $this per entity"
+	end
+
+	local components_lookup = world.components_lookup
+	local archetypes = world.archetypes
+	local ECS_PAIR = internal.ECS_PAIR
+	local get_entity_record = internal.get_entity_record
+
+	local list, map, observe_cleanup = internal.OBSERVE_MATCHED_ARCHETYPES(world, prematcher.with_ids, without_ids)
+	local probe: (Archetype) -> boolean = iter_program(query, {}, true) :: any
+
+	local reported: Map<u53, boolean> = {}
+	local added_callback: ((entity: u53) -> ())? = nil
+	local removed_callback: ((entity: u53) -> ())? = nil
+
+	local function report_added(entity: u53)
+		reported[entity] = true
+		if added_callback then
+			added_callback(entity)
+		end
+	end
+
+	local function report_removed(entity: u53)
+		reported[entity] = nil
+		if removed_callback then
+			removed_callback(entity)
+		end
+	end
+
+	local function reconcile_entity(entity: u53, archetype: Archetype?)
+		if not archetype then
+			local record = get_entity_record(entity)
+			archetype = if record then record.archetype else nil
+		end
+		local valid = archetype ~= nil and map[archetype.archetype_id] ~= nil and probe(archetype)
+		if valid then
+			if not reported[entity] then
+				report_added(entity)
+			end
+		elseif reported[entity] then
+			report_removed(entity)
+		end
+	end
+
+	-- every entity of an archetype shares its validity
+	local function reconcile_archetype(archetype: Archetype)
+		local entities = archetype.entities
+		if probe(archetype) then
+			for row = #entities, 1, -1 do
+				local entity: u53 = entities[row] :: any
+				if entity ~= nil and not reported[entity] then
+					report_added(entity)
+				end
+			end
+		else
+			for row = #entities, 1, -1 do
+				local entity: u53 = entities[row] :: any
+				if entity ~= nil and reported[entity] then
+					report_removed(entity)
+				end
+			end
+		end
+	end
+
+	local function reconcile_all()
+		for index = #list, 1, -1 do
+			local archetype = list[index]
+			if archetype and archetype.alive then
+				reconcile_archetype(archetype)
+			end
+		end
+	end
+
+	-- re-evaluates every archetype holding (relation, source): all of its
+	-- entities depend on `source`. Recursion follows the chain downwards.
+	local function propagate_down(relation: u53, source: u53, recursive: boolean, depth: number)
+		local record = components_lookup[ECS_PAIR(relation, source)]
+		if not record then
+			return
+		end
+		local archetype_ids = record.archetype_ids
+		for index = #archetype_ids, 1, -1 do
+			local archetype_id = archetype_ids[index]
+			local archetype = if archetype_id then archetypes[archetype_id] else nil
+			if not archetype or not archetype.alive then
+				continue
+			end
+			if map[archetype_id] then
+				reconcile_archetype(archetype)
+			end
+			if recursive and depth < MAX_UP_DEPTH then
+				local entities = archetype.entities
+				for row = #entities, 1, -1 do
+					local entity: u53 = entities[row] :: any
+					if entity ~= nil then
+						propagate_down(relation, entity, true, depth + 1)
+					end
+				end
+			end
+		end
+	end
+
+	local detaches: { () -> () } = {}
+
+	-- membership: entering or leaving the prematched set, entity deletion
+	local membership: types.QueryIdMonitor = {
+		match = function(archetype: Archetype): boolean
+			return map[archetype.archetype_id] ~= nil
+		end,
+		added = function(entity: u53, _: number?, destination: Archetype?)
+			reconcile_entity(entity, destination)
+		end,
+		removed = function(entity: u53)
+			reconcile_entity(entity, nil)
+		end,
+	}
+	table.insert(detaches, internal.MONITOR_ATTACH(world, prematcher.with_ids, membership))
+	if without_ids then
+		table.insert(detaches, internal.MONITOR_ATTACH(world, without_ids, membership))
+	end
+
+	local function always(): boolean
+		return true
+	end
+
+	-- self watch: `$this` changes that keep it inside the prematched set
+	if #query.self_watch > 0 then
+		table.insert(
+			detaches,
+			internal.OBSERVER_ATTACH(world, query.self_watch, {
+				match = always,
+				callback = function(entity: u53)
+					reconcile_entity(entity, nil)
+				end,
+			})
+		)
+	end
+
+	-- dependency watch: ids other entities provide through a relation
+	for _, watch in query.dep_watch do
+		local relation, recursive = watch.relation, watch.recursive
+		table.insert(
+			detaches,
+			internal.OBSERVER_ATTACH(world, { watch.id }, {
+				match = always,
+				callback = function(entity: u53)
+					reconcile_entity(entity, nil)
+					propagate_down(relation, entity, recursive, 1)
+				end,
+			})
+		)
+	end
+
+	if #query.global_watch > 0 then
+		table.insert(
+			detaches,
+			internal.OBSERVER_ATTACH(world, query.global_watch, {
+				match = always,
+				callback = function()
+					reconcile_all()
+				end,
+			})
+		)
+	end
+
+	local function cleanup()
+		for _, detach in detaches do
+			detach()
+		end
+		table.clear(detaches)
+		observe_cleanup()
+		table.clear(reported)
+	end
+
+	-- entities matching at creation are tracked silently (no callbacks are set
+	-- yet) so that they get `removed` when they stop matching
+	reconcile_all()
+
+	return {
+		added = function(callback: (entity: u53) -> ())
+			added_callback = callback
+		end,
+		removed = function(callback: (entity: u53) -> ())
+			removed_callback = callback
+		end,
+		cleanup = cleanup,
+	} :: any
+end
+
 query_mt.iter = query_iter
 query_mt.__iter = query_iter
+query_mt.monitor = query_monitor
 query_mt.archetypes = query_archetypes
 query_mt.match = query_match
 query_mt.rematch = query_rematch

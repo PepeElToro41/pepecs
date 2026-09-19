@@ -28,7 +28,8 @@ export type ArchetypeMatch = (archetype: Archetype) -> boolean
 export type ArchetypeObserverCallback = (archetype: Archetype) -> ()
 export type ArchetypeObserver = { match: ArchetypeMatch, callback: ArchetypeObserverCallback }
 
-export type QueryMonitorCallback = (entity: u53, operation_id: number?) -> ()
+-- archetype is the destination for added callbacks and the source for removed ones
+export type QueryMonitorCallback = (entity: u53, operation_id: number?, archetype: Archetype?) -> ()
 
 export type QueryIdMonitor = {
 	match: ArchetypeMatch,
@@ -259,6 +260,9 @@ export type WorldInternal = {
 		with_ids: { number },
 		without_ids: { number }?
 	) -> ({ Archetype }, Map<ArchetypeId, number>, Cleanup),
+	MONITOR_ATTACH: (world: World, ids: { u53 }, monitor: QueryIdMonitor) -> Cleanup,
+	OBSERVER_ATTACH: (world: World, ids: { u53 }, observer: QueryIdObserver) -> Cleanup,
+	monitor_new: (world: World, with_ids: { u53 }, without_ids: { u53 }?) -> Monitor,
 
 	get_archetypes_count: () -> number,
 
@@ -446,6 +450,7 @@ export type EngineQuery = typeof(setmetatable(
 		cached: (self: EngineQuery) -> EngineQuery,
 		cleanup: (self: EngineQuery) -> (),
 		var: (self: EngineQuery, name: string) -> any,
+		monitor: (self: EngineQuery) -> Monitor,
 		is_cached: boolean,
 	},
 	{} :: { __iter: (self: EngineQuery) -> () -> ...any }

@@ -3887,6 +3887,321 @@ TEST("query engine", function()
 	end)
 end)
 
+TEST("query engine monitor", function()
+	-- collects added / removed events into two lists
+	local function record(monitor: any)
+		local log = { added = {}, removed = {} }
+		monitor.added(function(entity)
+			table.insert(log.added, entity)
+		end)
+		monitor.removed(function(entity)
+			table.insert(log.removed, entity)
+		end)
+		return log
+	end
+
+	local function drain(log): ({ any }, { any })
+		local added, removed = log.added, log.removed
+		log.added, log.removed = {}, {}
+		return added, removed
+	end
+
+	CASE("static queries reuse the plain monitor", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local B = world.tag()
+		local e = world.entity()
+		local log = record(world.query_build():with(A):without(B):build():monitor())
+
+		world.add(e, A)
+		expect(drain(log)).to.equal { e }
+		world.add(e, B)
+		local added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal { e }
+		world.remove(e, B)
+		expect(drain(log)).to.equal { e }
+		world.delete(e)
+		added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal { e }
+	end)
+
+	CASE("up: parent changes fire on the child immediately", function()
+		local world = ecs.world()
+		local Position = world.component()
+		local p1 = world.entity()
+		local p2 = world.entity()
+		local child = world.entity()
+		world.set(p1, Position, 1)
+
+		local log = record(world.query_build():term(Position):up(ecs.ChildOf):build():monitor())
+
+		world.add(child, ecs.pair(ecs.ChildOf, p1))
+		expect(drain(log)).to.equal { child }
+
+		world.remove(p1, Position)
+		local added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal { child }
+
+		world.set(p1, Position, 2)
+		expect(drain(log)).to.equal { child }
+
+		-- reparent to a parent without Position, then back
+		world.add(child, ecs.pair(ecs.ChildOf, p2))
+		added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal { child }
+
+		world.add(child, ecs.pair(ecs.ChildOf, p1))
+		expect(drain(log)).to.equal { child }
+
+		world.remove(child, ecs.pair(ecs.ChildOf, p1))
+		added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal { child }
+	end)
+
+	CASE("up: propagation reaches grandchildren through a child without the component", function()
+		local world = ecs.world()
+		local Position = world.component()
+		local grandparent = world.entity()
+		local parent = world.entity()
+		local child = world.entity()
+		world.set(grandparent, Position, 1)
+		world.add(parent, ecs.pair(ecs.ChildOf, grandparent))
+		world.add(child, ecs.pair(ecs.ChildOf, parent))
+
+		local log = record(world.query_build():term(Position):up(ecs.ChildOf):build():monitor())
+		expect(drain(log)).to.equal {}
+
+		-- a new entity entering below an already matching chain
+		local late = world.entity()
+		world.add(late, ecs.pair(ecs.ChildOf, child))
+		expect(drain(log)).to.equal { late }
+
+		-- entities matching before the monitor existed are tracked silently
+		world.remove(grandparent, Position)
+		local added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(sorted(removed)).to.equal(sorted { parent, child, late })
+
+		world.set(grandparent, Position, 2)
+		expect(sorted(drain(log))).to.equal(sorted { parent, child, late })
+
+		-- the middle entity gains its own Position: nothing changes
+		world.set(parent, Position, 3)
+		added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal {}
+
+		-- grandparent loses it now: only parent stops matching, child and late
+		-- resolve through parent
+		world.remove(grandparent, Position)
+		added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal { parent }
+
+		world.remove(parent, Position)
+		added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(sorted(removed)).to.equal(sorted { child, late })
+	end)
+
+	CASE("up: deleting the parent removes every descendant exactly once", function()
+		local world = ecs.world()
+		local Position = world.component()
+		local parent = world.entity()
+		local c1 = world.entity()
+		local c2 = world.entity()
+		local gc = world.entity()
+		world.set(parent, Position, 1)
+
+		local log = record(world.query_build():term(Position):up(ecs.ChildOf):build():monitor())
+		world.add(c1, ecs.pair(ecs.ChildOf, parent))
+		world.add(c2, ecs.pair(ecs.ChildOf, parent))
+		world.add(gc, ecs.pair(ecs.ChildOf, c1))
+		expect(sorted(drain(log))).to.equal(sorted { c1, c2, gc })
+
+		world.delete(parent)
+		local added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(sorted(removed)).to.equal(sorted { c1, c2, gc })
+	end)
+
+	CASE("bor alternatives fire without leaving the prematched set", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local B = world.tag()
+		local C = world.tag()
+		local e = world.entity()
+		local log = record(world.query_build():with(C):term(A):bor():term(B):build():monitor())
+
+		world.add(e, C)
+		expect(drain(log)).to.equal {}
+		world.add(e, A)
+		expect(drain(log)).to.equal { e }
+		world.add(e, B)
+		expect(drain(log)).to.equal {}
+		world.remove(e, A)
+		expect(drain(log)).to.equal {}
+		world.remove(e, B)
+		local added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal { e }
+		world.add(e, A)
+		expect(drain(log)).to.equal { e }
+		world.remove(e, C)
+		added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal { e }
+	end)
+
+	CASE("variable target: changes on the target propagate to its holders", function()
+		local world = ecs.world()
+		local Likes = world.tag()
+		local Tag = world.tag()
+		local apple = world.entity()
+		local pear = world.entity()
+		local e1 = world.entity()
+		local e2 = world.entity()
+		local e3 = world.entity()
+		world.add(e1, ecs.pair(Likes, apple))
+		world.add(e2, ecs.pair(Likes, apple))
+		world.add(e3, ecs.pair(Likes, pear))
+
+		local log = record(world.query_build():term(Likes):target("$v"):with(Tag):from("$v"):build():monitor())
+
+		world.add(apple, Tag)
+		expect(sorted(drain(log))).to.equal(sorted { e1, e2 })
+		world.add(pear, Tag)
+		expect(drain(log)).to.equal { e3 }
+		world.remove(apple, Tag)
+		local added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(sorted(removed)).to.equal(sorted { e1, e2 })
+
+		-- changing the target keeps the entity in the prematched set
+		world.remove(e3, ecs.pair(Likes, pear))
+		added, removed = drain(log)
+		expect(removed).to.equal { e3 }
+		world.add(e3, ecs.pair(Likes, apple))
+		expect(drain(log)).to.equal {}
+		world.add(e3, ecs.pair(Likes, pear))
+		expect(drain(log)).to.equal { e3 }
+	end)
+
+	CASE("unwatched moves keep events balanced", function()
+		local world = ecs.world()
+		local Position = world.component()
+		local Health = world.component()
+		local parent = world.entity()
+		local child = world.entity()
+		world.set(parent, Position, 1)
+
+		local log = record(world.query_build():term(Position):up(ecs.ChildOf):build():monitor())
+		world.add(child, ecs.pair(ecs.ChildOf, parent))
+		expect(drain(log)).to.equal { child }
+
+		world.set(child, Health, 10)
+		expect(drain(log)).to.equal {}
+		world.remove(parent, Position)
+		local added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal { child }
+		world.remove(child, ecs.pair(ecs.ChildOf, parent))
+		added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal {}
+	end)
+
+	CASE("spawning many children fires one added per child", function()
+		local world = ecs.world()
+		local Position = world.component()
+		local parent = world.entity()
+		world.set(parent, Position, 1)
+
+		local calls = 0
+		local monitor = world.query_build():term(Position):up(ecs.ChildOf):build():monitor()
+		monitor.added(function()
+			calls += 1
+		end)
+
+		for _ = 1, 50 do
+			local child = world.entity()
+			world.add(child, ecs.pair(ecs.ChildOf, parent))
+		end
+		expect(calls).to.equal(50)
+
+		local removed = 0
+		monitor.removed(function()
+			removed += 1
+		end)
+		world.remove(parent, Position)
+		expect(removed).to.equal(50)
+		expect(calls).to.equal(50)
+	end)
+
+	CASE("callbacks may mutate the world", function()
+		local world = ecs.world()
+		local Position = world.component()
+		local Seen = world.tag()
+		local parent = world.entity()
+		world.set(parent, Position, 1)
+
+		local monitor = world.query_build():term(Position):up(ecs.ChildOf):build():monitor()
+		local added, removed = 0, 0
+		monitor.added(function(entity)
+			added += 1
+			world.add(entity, Seen)
+		end)
+		monitor.removed(function(entity)
+			removed += 1
+			world.delete(entity)
+		end)
+
+		local c1 = world.entity()
+		local c2 = world.entity()
+		world.add(c1, ecs.pair(ecs.ChildOf, parent))
+		world.add(c2, ecs.pair(ecs.ChildOf, parent))
+		expect(added).to.equal(2)
+		expect(world.has(c1, Seen)).to.equal(true)
+
+		world.remove(parent, Position)
+		expect(removed).to.equal(2)
+		expect(world.alive(c1)).to.equal(false)
+		expect(world.alive(c2)).to.equal(false)
+		expect(added).to.equal(2)
+	end)
+
+	CASE("per entity queries error and cleanup detaches every hook", function()
+		local world = ecs.world()
+		local A = world.tag()
+		local Likes = world.tag()
+		local Position = world.component()
+
+		expect(function()
+			world.query_build():with(A):with(Likes):from("$other"):target("$this"):build():monitor()
+		end).to.throw "per entity"
+
+		local parent = world.entity()
+		local child = world.entity()
+		world.set(parent, Position, 1)
+		local monitor = world.query_build():term(Position):up(ecs.ChildOf):build():monitor()
+		local log = record(monitor)
+		world.add(child, ecs.pair(ecs.ChildOf, parent))
+		expect(drain(log)).to.equal { child }
+
+		monitor.cleanup()
+		world.remove(parent, Position)
+		world.remove(child, ecs.pair(ecs.ChildOf, parent))
+		local added, removed = drain(log)
+		expect(added).to.equal {}
+		expect(removed).to.equal {}
+	end)
+end)
+
 local report = testlib.run(plan)
 testlib.report(report)
 

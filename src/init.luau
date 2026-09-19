@@ -337,14 +337,14 @@ local function FIRE_MONITORS_ENTITIES(
 					local removed = monitor.removed
 					if removed then
 						for _, entity in entities do
-							removed(entity, operation_id)
+							removed(entity, operation_id, source)
 						end
 					end
 				else
 					local added = monitor.added
 					if added then
 						for _, entity in entities do
-							added(entity, operation_id)
+							added(entity, operation_id, destination)
 						end
 					end
 				end
@@ -388,12 +388,12 @@ local function FIRE_MONITORS(
 				if matched_before then
 					local removed = monitor.removed
 					if removed then
-						removed(entity, operation_id)
+						removed(entity, operation_id, source)
 					end
 				else
 					local added = monitor.added
 					if added then
-						added(entity, operation_id)
+						added(entity, operation_id, destination)
 					end
 				end
 			end
@@ -412,7 +412,7 @@ local function FIRE_MONITORS_ADDED(
 			local added = monitor.added
 			if added then
 				if monitor.match(destination) then
-					added(entity, operation_id)
+					added(entity, operation_id, destination)
 				end
 			end
 		end
@@ -430,7 +430,7 @@ local function FIRE_MONITORS_REMOVED(
 			local removed = monitor.removed
 			if removed then
 				if monitor.match(source) then
-					removed(entity, operation_id)
+					removed(entity, operation_id, source)
 				end
 			end
 		end
@@ -659,6 +659,75 @@ local function OBSERVE_MATCHED_ARCHETYPES(world: World, with_ids: { number }, wi
 	return compatible_archetypes, compatible_archetypes_map, cleanup
 end
 
+-- Registers `query_observer` in the `observers_added` list of every id (pairs
+-- propagate to their wildcard records). Returns the detach function.
+local function OBSERVER_ATTACH(world: World, ids: { u53 }, query_observer: QueryIdObserver): () -> ()
+	local component_record_ensure = world.internal.component_record_ensure
+	local inserted_in: { { QueryIdObserver } } = {}
+
+	for _, id in ids do
+		local component_record = component_record_ensure(id)
+		local all_observers = component_record.observers_added
+		if all_observers then
+			local observers = all_observers[PAIR_HOOK_INDEX]
+			table.insert(observers, query_observer)
+			table.insert(inserted_in, observers)
+		else
+			local observers = { [PAIR_HOOK_INDEX] = query_observer }
+			local all_observers = { observers }
+			component_record.observers_added = all_observers
+			if IS_PAIR(id) then
+				PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_observers, function(record)
+					return record.observers_added
+				end, function(record, set_observers)
+					record.observers_added = set_observers
+				end)
+			end
+
+			table.insert(inserted_in, observers)
+		end
+	end
+
+	return function()
+		REMOVE_INSERTED_OBSERVERS(inserted_in, query_observer)
+	end
+end
+
+-- Registers `query_monitor` in the `monitors` list of every id. Returns the
+-- detach function.
+local function MONITOR_ATTACH(world: World, ids: { u53 }, query_monitor: QueryIdMonitor): () -> ()
+	local component_record_ensure = world.internal.component_record_ensure
+	local inserted_in: { { QueryIdMonitor } } = {}
+
+	for _, id in ids do
+		local component_record = component_record_ensure(id)
+		local all_monitors = component_record.monitors
+		if all_monitors then
+			local monitors = all_monitors[PAIR_HOOK_INDEX]
+			table.insert(monitors, query_monitor)
+			table.insert(inserted_in, monitors)
+		else
+			local monitors = { [PAIR_HOOK_INDEX] = query_monitor }
+			local all_monitors = { monitors }
+			component_record.monitors = all_monitors
+
+			if IS_PAIR(id) then
+				PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_monitors, function(record)
+					return record.monitors
+				end, function(record, set_monitors)
+					record.monitors = set_monitors
+				end)
+			end
+
+			table.insert(inserted_in, monitors)
+		end
+	end
+
+	return function()
+		REMOVE_INSERTED_OBSERVERS(inserted_in, query_monitor)
+	end
+end
+
 -- TODO: make archetype caching optional
 local function observer_new(
 	world: World,
@@ -696,35 +765,8 @@ local function observer_new(
 
 	local inserted_in: { { QueryIdObserver } } = {}
 
-	local function insert_added_observers(ids: { u53 })
-		for _, id in ids do
-			local component_record = component_record_ensure(id)
-			local all_observers = component_record.observers_added
-			if all_observers then
-				local observers = all_observers[PAIR_HOOK_INDEX]
-				table.insert(observers, query_observer)
-				table.insert(inserted_in, observers)
-			else
-				local observers = { [PAIR_HOOK_INDEX] = query_observer }
-				local all_observers = { observers }
-				component_record.observers_added = all_observers
-				if IS_PAIR(id) then
-					PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_observers, function(record)
-						return record.observers_added
-					end, function(record, set_observers)
-						record.observers_added = set_observers
-					end)
-				end
-
-				table.insert(inserted_in, observers)
-			end
-		end
-	end
-
-	insert_added_observers(with_ids)
-	if without_ids then
-		insert_added_observers(without_ids)
-	end
+	local added_detach = OBSERVER_ATTACH(world, with_ids, query_observer)
+	local without_detach: () -> () = if without_ids then OBSERVER_ATTACH(world, without_ids, query_observer) else NOOP
 
 	for _, id in terms do
 		local component_record = component_record_ensure(id)
@@ -752,13 +794,14 @@ local function observer_new(
 
 	return function()
 		observers_cleanup()
+		added_detach()
+		without_detach()
 		REMOVE_INSERTED_OBSERVERS(inserted_in, query_observer)
 	end
 end
 
 -- TODO: make archetype caching optional
-local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }?)
-	local component_record_ensure = world.internal.component_record_ensure
+local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }?): Monitor
 	local _, archetypes_map, cache_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids)
 	local last_operation_id: number? = nil
 	local fired_entities: { [u53]: boolean } = {}
@@ -772,8 +815,6 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 		added = nil,
 		removed = nil,
 	}
-
-	local inserted_in: { { QueryIdMonitor } } = {}
 
 	local function monitor_added(callback: QueryMonitorCallback)
 		query_monitor.added = function(entity, operation_id)
@@ -807,35 +848,13 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 		end
 	end
 
+	local with_detach = MONITOR_ATTACH(world, with_ids, query_monitor)
+	local without_detach: () -> () = if without_ids then MONITOR_ATTACH(world, without_ids, query_monitor) else NOOP
+
 	local function cleanup()
 		cache_cleanup()
-		REMOVE_INSERTED_OBSERVERS(inserted_in, query_monitor)
-	end
-
-	local function insert_monitors(ids: { u53 })
-		for _, id in ids do
-			local component_record = component_record_ensure(id)
-			local all_monitors = component_record.monitors
-			if all_monitors then
-				local monitors = all_monitors[PAIR_HOOK_INDEX]
-				table.insert(monitors, query_monitor)
-				table.insert(inserted_in, monitors)
-			else
-				local monitors = { [PAIR_HOOK_INDEX] = query_monitor }
-				local all_monitors = { monitors }
-				component_record.monitors = all_monitors
-
-				if IS_PAIR(id) then
-					PROPAGATE_PAIR_EVENTS(world, id, component_record :: PairRecord, all_monitors, function(record)
-						return record.monitors
-					end, function(record, set_monitors)
-						record.monitors = set_monitors
-					end)
-				end
-
-				table.insert(inserted_in, monitors)
-			end
-		end
+		with_detach()
+		without_detach()
 	end
 
 	local monitor: Monitor = {
@@ -843,11 +862,6 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 		removed = monitor_removed :: any,
 		cleanup = cleanup,
 	}
-
-	insert_monitors(with_ids)
-	if without_ids then
-		insert_monitors(without_ids)
-	end
 
 	return monitor
 end
@@ -4542,6 +4556,9 @@ local function world_new()
 		MATCH_ARCHETYPE = MATCH_ARCHETYPE,
 		FIND_MATCHED_ARCHETYPES = FIND_MATCHED_ARCHETYPES,
 		OBSERVE_MATCHED_ARCHETYPES = OBSERVE_MATCHED_ARCHETYPES,
+		MONITOR_ATTACH = MONITOR_ATTACH,
+		OBSERVER_ATTACH = OBSERVER_ATTACH,
+		monitor_new = monitor_new,
 		get_archetypes_count = function()
 			return archetypes_count
 		end,
