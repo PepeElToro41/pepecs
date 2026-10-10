@@ -53,6 +53,10 @@ type Term = {
 	src_var: number,
 	tgt_var: number,
 	rel_wc: u53,
+	-- the id lives in DontFragment sparse storage: checked per entity
+	sparse: boolean,
+	-- `up` is a DontFragment relation: the first pair is resolved per entity
+	up_sparse: boolean,
 }
 
 type BuilderInternal = {
@@ -97,6 +101,11 @@ type QueryInternal = {
 
 	-- monitor support: true when the program binds `$this` per entity
 	per_entity: boolean,
+	-- any term touches DontFragment storage (monitors are archetype based)
+	has_sparse: boolean,
+	-- no fragmenting term selects `$this`: the program iterates the sparse
+	-- set of this record instead of the prematched archetypes
+	sparse_driver: u53?,
 	-- `$this` ids that can change validity without leaving the prematched set
 	self_watch: { u53 },
 	dep_watch: { DependencyWatch },
@@ -144,6 +153,14 @@ local OP_FROM_SELECT = 14
 local OP_FROM_SELECT_PAIR = 15
 local OP_JMP = 16
 local OP_NONE = 17
+-- DontFragment ids: the entity of the source variable must be bound
+local OP_SPARSE_CHECK = 18
+local OP_SPARSE_TARGET_VAR = 19
+local OP_SPARSE_FROM_SELECT = 20
+local OP_SELECT_SPARSE = 21
+
+-- OP_SPARSE_CHECK modes: MODE_TERM / MODE_WITH / MODE_WITHOUT plus optional
+local SPARSE_OPTIONAL = 4
 
 -- instruction layout: [op, fail_pc, fail_redo, A, B, C, D, E]
 local STRIDE = 8
@@ -187,6 +204,8 @@ local function builder_new_term(builder: BuilderInternal, id: u53, mode: number)
 		src_var = THIS_VAR,
 		tgt_var = 0,
 		rel_wc = 0,
+		sparse = false,
+		up_sparse = false,
 	}
 
 	if previous_or then
@@ -326,8 +345,13 @@ end
 -- without the relation come first). Sorting only; combine with :up() to
 -- also read the term from the parent.
 function builder_mt.cascade(builder: BuilderInternal, relation: u53): BuilderInternal
-	if builder.world.internal.IS_PAIR(relation) then
+	local internal = builder.world.internal
+	if internal.IS_PAIR(relation) then
 		error ":cascade() expects a relation, not a pair"
+	end
+	-- depth is per entity for such relations, archetypes cannot be sorted
+	if (builder.world.has :: any)(relation, internal.ECS_DONT_FRAGMENT) then
+		error ":cascade() is not supported on a DontFragment relation"
 	end
 	local existing = builder.cascade_relation
 	if existing and existing ~= relation then
@@ -346,71 +370,132 @@ builder_mt["self"] = function(builder: BuilderInternal): BuilderInternal
 	return builder
 end
 
--- traverses up `rel_wc` from `archetype` until an archetype holding `id` is found.
--- Returns the holder row (0 when `include_self` hit the starting archetype)
--- and the column, or nil when nothing up the chain has `id`. Follows the first
--- target of the relation on every level.
+-- Sparse set and slot of a DontFragment `id` held by the entity, nil when
+-- the entity does not hold it. (R, *) resolves to the first pair of R.
+local function sparse_slot_of(
+	components_lookup: Map<u53, ComponentRecord>,
+	ECS_WILDCARD: u53,
+	PAIR_SECOND: (u53) -> u24,
+	entity_id: u24,
+	id: u53
+): (types.SparseSet?, number?)
+	local record = (components_lookup[id] :: any) :: PairRecord?
+	local set = if record then record.sparse else nil
+	if not set then
+		return nil, nil
+	end
+	local slot = set.index[entity_id]
+	if not slot then
+		return nil, nil
+	end
+	if PAIR_SECOND(id) == ECS_WILDCARD then
+		local first_record = components_lookup[set.values[slot][1]] :: PairRecord
+		local first_set = first_record.sparse :: types.SparseSet
+		return first_set, first_set.index[entity_id]
+	end
+	return set, slot
+end
+
+-- Builds the up traversal for one world.
+--
+-- traverse_up walks `rel_wc` from `archetype` (the entity when given) until
+-- a holder of `id` is found. Returns the holder row (0 when `include_self`
+-- hit the starting archetype itself) and the column, or nil when nothing up
+-- the chain has `id`. Follows the first target of the relation on every
+-- level. A row other than 0 indexes the returned column directly, which
+-- also covers DontFragment ids: their column is the sparse values array and
+-- the row the holder's slot.
 --
 -- Relations with the Traversable trait resolve through the hierarchy: the
 -- (R, T) record of the first pair caches the nearest holder of every id.
 -- Other relations walk the chain and give up after MAX_UP_DEPTH so transient
--- relation cycles cannot hang the query.
-local function traverse_up(
-	components_lookup: Map<u53, ComponentRecord>,
-	sparse: Map<u24, EntityRecord>,
-	PAIR_SECOND: (u53) -> u24,
-	reachable: (HierarchyNode) -> Map<u53, ReachableElement>,
-	archetype: Archetype,
-	rel_wc: u53,
-	id: u53,
-	include_self: boolean
-): (number?, Column?)
-	if include_self then
-		local column = archetype.columns_map[id]
-		if column then
-			return 0, column
+-- relation cycles cannot hang the query. DontFragment relations and
+-- `include_self` on a DontFragment id need `entity`; the planner binds
+-- `$this` per entity for those terms.
+local function make_traverse_up(world: World)
+	local internal = world.internal
+	local components_lookup = world.components_lookup
+	local sparse = internal.entity_index.sparse
+	local PAIR_SECOND = internal.PAIR_SECOND
+	local ENTITY_ID = internal.ENTITY_ID
+	local ECS_WILDCARD = internal.ECS_WILDCARD
+	local reachable = internal.hierarchy.reachable
+	local first_pair_of = internal.first_pair_of
+
+	return function(archetype: Archetype, entity: u53?, rel_wc: u53, id: u53, include_self: boolean): (number?, Column?)
+		local record: EntityRecord? = if entity then sparse[ENTITY_ID(entity)] else nil
+
+		if include_self then
+			local column = archetype.columns_map[id]
+			if column then
+				return 0, column
+			end
+			if record and record.sparse_count > 0 then
+				local set, slot =
+					sparse_slot_of(components_lookup, ECS_WILDCARD, PAIR_SECOND, ENTITY_ID(entity :: u53), id)
+				if set then
+					return slot, set.values
+				end
+			end
 		end
-	end
 
-	local pair_record = components_lookup[rel_wc]
-	if not pair_record then
-		return nil, nil
-	end
-	local column_index = pair_record.column_index
-
-	local index = column_index[archetype.archetype_id]
-	if not index then
-		return nil, nil
-	end
-
-	local first_record = components_lookup[archetype.components[index]] :: PairRecord
-	local node = first_record and first_record.node
-	if node then
-		local element = reachable(node)[id]
-		if element then
-			return element.record.archetype_row, element.column
-		end
-		return nil, nil
-	end
-
-	for _ = 1, MAX_UP_DEPTH do
-		local record = sparse[PAIR_SECOND(archetype.components[index])]
-		if not record then
+		local relation_record = components_lookup[rel_wc] :: PairRecord
+		if not relation_record then
 			return nil, nil
 		end
-		local holder = record.archetype
-		local column = holder.columns_map[id]
-		if column then
-			return record.archetype_row, column
+
+		local pair_id: u53?
+		if record then
+			pair_id = first_pair_of(record, relation_record)
+		elseif relation_record.sparse then
+			-- unreachable: the planner binds the entity for DontFragment relations
+			return nil, nil
+		else
+			local index = relation_record.column_index[archetype.archetype_id]
+			pair_id = if index then archetype.components[index] else nil
 		end
-		archetype = holder
-		index = column_index[archetype.archetype_id]
-		if not index then
+		if not pair_id then
 			return nil, nil
 		end
-	end
 
-	return nil, nil
+		local first_record = components_lookup[pair_id] :: PairRecord
+		local node = first_record and first_record.node
+		if node then
+			local element = reachable(node)[id]
+			if element then
+				local element_sparse = element.sparse
+				if element_sparse then
+					return element_sparse.index[ENTITY_ID(element.entity)], element.column
+				end
+				return element.record.archetype_row, element.column
+			end
+			return nil, nil
+		end
+
+		for _ = 1, MAX_UP_DEPTH do
+			local target_id = PAIR_SECOND(pair_id :: u53)
+			local target_record = sparse[target_id]
+			if not target_record then
+				return nil, nil
+			end
+			local column = target_record.archetype.columns_map[id]
+			if column then
+				return target_record.archetype_row, column
+			end
+			if target_record.sparse_count > 0 then
+				local set, slot = sparse_slot_of(components_lookup, ECS_WILDCARD, PAIR_SECOND, target_id, id)
+				if set then
+					return slot, set.values
+				end
+			end
+			pair_id = first_pair_of(target_record, relation_record)
+			if not pair_id then
+				return nil, nil
+			end
+		end
+
+		return nil, nil
+	end
 end
 
 -------------------------------------------------------------------------------
@@ -499,6 +584,7 @@ local function compile(builder: BuilderInternal): QueryInternal
 	local PAIR_FIRST = internal.PAIR_FIRST
 	local PAIR_SECOND = internal.PAIR_SECOND
 	local ECS_TRANSITIVE = internal.ECS_TRANSITIVE
+	local ECS_DONT_FRAGMENT = internal.ECS_DONT_FRAGMENT
 	local get_entity_alive = internal.get_entity_alive
 
 	local function normalise(term: Term)
@@ -544,6 +630,15 @@ local function compile(builder: BuilderInternal): QueryInternal
 		local up = term.up
 		if up then
 			term.rel_wc = ECS_PAIR(up, ECS_WILDCARD)
+			term.up_sparse = has(up, ECS_DONT_FRAGMENT)
+		end
+
+		-- DontFragment pairs are checked per entity against sparse storage.
+		-- (*, T) has no storage of its own and stays an archetype check.
+		local rid = term.rid
+		if IS_PAIR(rid) and PAIR_FIRST(rid) ~= ECS_WILDCARD then
+			local relation_entity = get_entity_alive(PAIR_FIRST(rid))
+			term.sparse = relation_entity ~= nil and has(relation_entity, ECS_DONT_FRAGMENT)
 		end
 	end
 
@@ -569,17 +664,38 @@ local function compile(builder: BuilderInternal): QueryInternal
 	local with_set: Map<u53, boolean> = {}
 	local without_set: Map<u53, boolean> = {}
 
+	-- DontFragment terms are not part of any archetype, so they never enter
+	-- the prematcher. They are checked per entity by the program.
+	local has_sparse = false
+	local sparse_driver: u53? = nil
+
 	for _, term in terms do
+		if term.sparse or term.up_sparse then
+			has_sparse = true
+		end
 		if term.src_var ~= THIS_VAR or term.or_next then
 			continue
 		end
 		if term.mode == MODE_WITHOUT then
-			if term.up == nil and term.tgt_var == 0 and not without_set[term.rid] then
+			if term.up == nil and term.tgt_var == 0 and not term.sparse and not without_set[term.rid] then
 				without_set[term.rid] = true
 				table.insert(without_ids, term.rid)
 			end
 		elseif not term.optional then
-			local id = if term.up then term.rel_wc else term.rid
+			local id: u53
+			if term.up then
+				if term.up_sparse then
+					sparse_driver = sparse_driver or term.rel_wc
+					continue
+				end
+				id = term.rel_wc
+			else
+				if term.sparse then
+					sparse_driver = sparse_driver or term.rid
+					continue
+				end
+				id = term.rid
+			end
 			if not with_set[id] then
 				with_set[id] = true
 				table.insert(with_ids, id)
@@ -587,7 +703,11 @@ local function compile(builder: BuilderInternal): QueryInternal
 		end
 	end
 
-	if #with_ids == 0 then
+	-- a fragmenting term drives the iteration whenever there is one; only a
+	-- query made of DontFragment terms iterates a sparse set directly
+	if #with_ids > 0 then
+		sparse_driver = nil
+	elseif not sparse_driver then
 		error "query needs at least one required term on $this"
 	end
 
@@ -611,7 +731,7 @@ local function compile(builder: BuilderInternal): QueryInternal
 	local term_ids: { u53 } = table.create(builder.n_out)
 
 	for _, term in terms do
-		if term.src_var ~= THIS_VAR or term.up or term.tgt_var ~= 0 or term.or_next then
+		if term.src_var ~= THIS_VAR or term.up or term.tgt_var ~= 0 or term.or_next or term.sparse then
 			is_static = false
 			break
 		end
@@ -640,6 +760,8 @@ local function compile(builder: BuilderInternal): QueryInternal
 		cacheable_results = true,
 
 		per_entity = false,
+		has_sparse = has_sparse,
+		sparse_driver = sparse_driver,
 		self_watch = {},
 		dep_watch = {},
 		global_watch = {},
@@ -669,10 +791,14 @@ local function compile(builder: BuilderInternal): QueryInternal
 	-- 5. plan ops -----------------------------------------------------------
 	local bound: Map<number, boolean> = { [THIS_VAR] = true }
 	local bind_relation: Map<number, u53?> = {}
-	local this_each = false
+	-- a sparse driver binds `$this` per entity from the start
+	local this_each = sparse_driver ~= nil
 
+	-- Row multiplier of an output read from `var`: `$this` results span the
+	-- rows of an archetype (m = 1) unless the program selects entities one by
+	-- one from a sparse set, where the result row is a slot of that set.
 	local function m_of(var: number): number
-		return if var == THIS_VAR then 1 else 0
+		return if var == THIS_VAR and not sparse_driver then 1 else 0
 	end
 
 	-- Builds the single check op for a term whose source is bound and whose
@@ -680,7 +806,8 @@ local function compile(builder: BuilderInternal): QueryInternal
 	local function check_op(term: Term): (OpRecord?, boolean)
 		local src = term.src_var
 		local m = m_of(src)
-		local needs_each = false
+		-- DontFragment checks need the entity of `$this`
+		local on_this = src == THIS_VAR and not this_each
 
 		if term.up then
 			local op = if term.mode == MODE_WITHOUT
@@ -688,10 +815,11 @@ local function compile(builder: BuilderInternal): QueryInternal
 				elseif term.mode == MODE_WITH then OP_UP_WITH
 				else OP_UP_TERM
 			local self_flag = if term.self then 1 else 0
+			local needs_each = on_this and (term.up_sparse or (term.self and term.sparse))
 			if op == OP_UP_TERM then
-				return op_record(op, false, src, term.rel_wc, term.rid, term.out, self_flag), false
+				return op_record(op, false, src, term.rel_wc, term.rid, term.out, self_flag), needs_each
 			end
-			return op_record(op, false, src, term.rel_wc, term.rid, self_flag), false
+			return op_record(op, false, src, term.rel_wc, term.rid, self_flag), needs_each
 		end
 
 		local tgt = term.tgt_var
@@ -699,9 +827,16 @@ local function compile(builder: BuilderInternal): QueryInternal
 			if not bound[tgt] then
 				return nil, false
 			end
-			needs_each = tgt == THIS_VAR and not this_each
+			if term.sparse then
+				return op_record(OP_SPARSE_CHECK, false, src, term.id, term.out, term.mode, tgt), on_this
+			end
+			local needs_each = tgt == THIS_VAR and not this_each
 			local op = if term.mode == MODE_WITHOUT then OP_TARGET_BOUND_NOT else OP_TARGET_BOUND
 			return op_record(op, false, src, term.id, tgt, term.out, m), needs_each
+		end
+
+		if term.sparse then
+			return op_record(OP_SPARSE_CHECK, false, src, term.rid, term.out, term.mode, 0), on_this
 		end
 
 		if term.mode == MODE_WITHOUT then
@@ -745,22 +880,42 @@ local function compile(builder: BuilderInternal): QueryInternal
 				return nil
 			end
 			local tgt = term.tgt_var
+			local sparse = term.sparse
 			if tgt == 0 then
 				return {
 					priority = 3,
 					needs_each = false,
-					ops = { op_record(OP_FROM_SELECT, true, src, term.rid, term.out) },
+					ops = {
+						if sparse
+							then op_record(OP_SPARSE_FROM_SELECT, true, src, term.rid, term.out, 0)
+							else op_record(OP_FROM_SELECT, true, src, term.rid, term.out),
+					},
 					binds = { src },
 				}
 			elseif bound[tgt] then
 				return {
 					priority = 3,
 					needs_each = tgt == THIS_VAR and not this_each,
-					ops = { op_record(OP_FROM_SELECT_PAIR, true, src, term.id, tgt, term.out) },
+					ops = {
+						if sparse
+							then op_record(OP_SPARSE_FROM_SELECT, true, src, term.id, term.out, tgt)
+							else op_record(OP_FROM_SELECT_PAIR, true, src, term.id, tgt, term.out),
+					},
 					binds = { src },
 				}
 			end
 			-- both source and target unbound: scan (rel, *) then enumerate targets
+			if sparse then
+				return {
+					priority = 3,
+					needs_each = false,
+					ops = {
+						op_record(OP_SPARSE_FROM_SELECT, true, src, term.rid, 0, 0),
+						op_record(OP_SPARSE_TARGET_VAR, true, src, term.rid, tgt, term.out),
+					},
+					binds = { src, tgt },
+				}
+			end
 			return {
 				priority = 3,
 				needs_each = false,
@@ -777,6 +932,15 @@ local function compile(builder: BuilderInternal): QueryInternal
 		if tgt ~= 0 and not bound[tgt] then
 			if not term_is_required(term) then
 				return nil
+			end
+			if term.sparse then
+				return {
+					priority = 2,
+					needs_each = src == THIS_VAR and not this_each,
+					ops = { op_record(OP_SPARSE_TARGET_VAR, true, src, term.rid, tgt, term.out) },
+					binds = { tgt },
+					bind_via = if src == THIS_VAR then term.id else nil,
+				}
 			end
 			return {
 				priority = 2,
@@ -795,6 +959,8 @@ local function compile(builder: BuilderInternal): QueryInternal
 		if term.optional then
 			if op.op == OP_TERM then
 				op.op = OP_TERM_OPT
+			elseif op.op == OP_SPARSE_CHECK and op.d == MODE_TERM then
+				op.d = SPARSE_OPTIONAL
 			else
 				table.insert(ops, op_record(OP_NONE, false, term.out))
 			end
@@ -844,10 +1010,35 @@ local function compile(builder: BuilderInternal): QueryInternal
 		end
 	end
 
-	emit(op_record(OP_SELECT_THIS, true))
-
 	local placed: Map<Term, boolean> = {}
 	local remaining = #terms
+
+	if sparse_driver then
+		-- Every entity of the driving set holds the driver's id, so a plain
+		-- required term on that id needs no check: the select op also writes
+		-- its output when the driver is a concrete (R, T) pair.
+		local driver_out = 0
+		for _, term in terms do
+			if
+				term.rid == sparse_driver
+				and term.src_var == THIS_VAR
+				and term.tgt_var == 0
+				and term.up == nil
+				and term.or_next == nil
+				and not term.optional
+				and term.mode ~= MODE_WITHOUT
+				and (term.out == 0 or PAIR_SECOND(term.rid) ~= ECS_WILDCARD)
+			then
+				driver_out = term.out
+				placed[term] = true
+				remaining -= 1
+				break
+			end
+		end
+		emit(op_record(OP_SELECT_SPARSE, true, sparse_driver, driver_out))
+	else
+		emit(op_record(OP_SELECT_THIS, true))
+	end
 
 	while remaining > 0 do
 		local best: TermPlan? = nil
@@ -982,7 +1173,7 @@ local function compile(builder: BuilderInternal): QueryInternal
 			fail_pc = last_iter
 			fail_redo = 1
 		end
-		if record.op == OP_SELECT_THIS then
+		if record.op == OP_SELECT_THIS or record.op == OP_SELECT_SPARSE then
 			fail_pc = 0
 			fail_redo = 0
 		end
@@ -999,7 +1190,7 @@ local function compile(builder: BuilderInternal): QueryInternal
 
 		if record.iter then
 			last_iter = pc
-			if record.op ~= OP_SELECT_THIS and record.op ~= OP_TARGET_VAR then
+			if record.op ~= OP_SELECT_THIS and record.op ~= OP_TARGET_VAR and record.op ~= OP_SELECT_SPARSE then
 				cacheable_results = false
 			end
 		end
@@ -1307,8 +1498,10 @@ local function iter_program(query: QueryInternal, list: { Archetype }, probe: bo
 	local dense = entity_index.dense
 	local ECS_PAIR = internal.ECS_PAIR
 	local PAIR_SECOND = internal.PAIR_SECOND
+	local ENTITY_ID = internal.ENTITY_ID
+	local ECS_WILDCARD = internal.ECS_WILDCARD
 	local EMPTY = internal.NULL_ARRAY
-	local reachable = internal.hierarchy.reachable
+	local traverse_up = make_traverse_up(world)
 
 	local code = query.code
 	local n_out = query.n_out
@@ -1365,6 +1558,145 @@ local function iter_program(query: QueryInternal, list: { Archetype }, probe: bo
 				ok = true
 			elseif op == OP_YIELD then
 				return true
+			elseif op == OP_EACH_THIS then
+				local entities = var_arch[THIS_VAR].entities
+				local count = #entities
+				local row = if redo then ctx[pc * 2 - 1] - 1 else count
+				if row > count then
+					row = count
+				end
+				if row < 1 then
+					ok = false
+				else
+					ctx[pc * 2 - 1] = row
+					var_ent[THIS_VAR], var_row[THIS_VAR] = entities[row] :: any, row
+					res_lo, res_hi = row, row
+					ok = true
+				end
+			elseif op == OP_SPARSE_CHECK then
+				-- A src var, B id (relation when E ~= 0), C out, D mode, E target var
+				local entity = var_ent[code[off + 4]]
+				local id = code[off + 5]
+				local tgt = code[off + 8]
+				if tgt ~= 0 then
+					local target = var_ent[tgt]
+					id = if target then ECS_PAIR(id, target) else 0
+				end
+
+				local mode = code[off + 7]
+				local out = code[off + 6]
+				local set: types.SparseSet? = nil
+				local slot: number? = nil
+				if entity then
+					if mode == MODE_TERM or mode == SPARSE_OPTIONAL then
+						-- the value of (R, *) is the one of the first pair
+						set, slot = sparse_slot_of(components_lookup, ECS_WILDCARD, PAIR_SECOND, ENTITY_ID(entity), id)
+					else
+						-- existence only: the (R, *) set answers directly
+						local record = (components_lookup[id] :: any) :: PairRecord?
+						set = if record then record.sparse else nil
+						slot = if set then set.index[ENTITY_ID(entity)] else nil
+					end
+				end
+
+				if mode == MODE_WITHOUT then
+					ok = slot == nil
+				elseif slot then
+					if out ~= 0 then
+						rc[out], rm[out], rb[out] = (set :: types.SparseSet).values, 0, slot
+					end
+					ok = true
+				elseif mode == SPARSE_OPTIONAL then
+					rc[out], rm[out], rb[out] = EMPTY, 0, 1
+					ok = true
+				else
+					ok = false
+				end
+			elseif op == OP_SELECT_SPARSE or op == OP_SPARSE_FROM_SELECT then
+				-- A var, B record id (relation when D ~= 0), C out, D target var.
+				-- Walks the sparse set backwards with clamping like OP_EACH_THIS,
+				-- so deleting the yielded entity is safe.
+				local var: number
+				local id: u53
+				local out = 0
+				if op == OP_SELECT_SPARSE then
+					var = THIS_VAR
+					id = code[off + 4]
+					out = code[off + 5]
+				else
+					var = code[off + 4]
+					id = code[off + 5]
+					out = code[off + 6]
+					local tgt = code[off + 7]
+					if tgt ~= 0 then
+						local target = var_ent[tgt]
+						id = if target then ECS_PAIR(id, target) else 0
+					end
+				end
+
+				local record = (components_lookup[id] :: any) :: PairRecord?
+				local set = if record then record.sparse else nil
+				ok = false
+				if set then
+					local set_dense = set.dense
+					local slot = if redo then ctx[pc * 2 - 1] - 1 else #set_dense
+					if slot > #set_dense then
+						slot = #set_dense
+					end
+					while slot >= 1 do
+						local entity = set_dense[slot]
+						local entity_record = sparse[ENTITY_ID(entity)]
+						if entity_record then
+							var_arch[var], var_row[var], var_ent[var] =
+								entity_record.archetype, entity_record.archetype_row, entity
+							if out ~= 0 then
+								rc[out], rm[out], rb[out] = set.values, 0, slot
+							end
+							if var == THIS_VAR then
+								res_entities = set_dense :: any
+								res_lo, res_hi = slot, slot
+							end
+							ctx[pc * 2 - 1] = slot
+							ok = true
+							break
+						end
+						slot -= 1
+					end
+				end
+			elseif op == OP_SPARSE_TARGET_VAR then
+				-- A src var, B (R, *) id, C target var, D out. Enumerates the
+				-- entity's list of (R, T) pairs.
+				local entity = var_ent[code[off + 4]]
+				local relation_record = (components_lookup[code[off + 5]] :: any) :: PairRecord?
+				local relation_set = if relation_record then relation_record.sparse else nil
+				local list: { u53 }? = nil
+				if relation_set and entity then
+					local slot = relation_set.index[ENTITY_ID(entity)]
+					list = if slot then relation_set.values[slot] else nil
+				end
+
+				local k = if redo then ctx[pc * 2 - 1] + 1 else 1
+				ok = false
+				if list then
+					while k <= #list do
+						local pair_id = list[k]
+						local target_record = sparse[PAIR_SECOND(pair_id)]
+						if target_record then
+							local var = code[off + 6]
+							var_arch[var], var_row[var], var_ent[var] =
+								target_record.archetype, target_record.archetype_row, dense[target_record.dense]
+							local out = code[off + 7]
+							if out ~= 0 then
+								local pair_set = (components_lookup[pair_id] :: PairRecord).sparse :: types.SparseSet
+								rc[out], rm[out], rb[out] = pair_set.values, 0, pair_set.index[ENTITY_ID(entity :: u53)]
+							end
+							ctx[pc * 2 - 1] = k
+							ok = true
+							break
+						end
+						k += 1
+					end
+				end
 			elseif op == OP_TERM_OPT then
 				local src = code[off + 4]
 				local term = code[off + 5]
@@ -1380,16 +1712,8 @@ local function iter_program(query: QueryInternal, list: { Archetype }, probe: bo
 				ok = true
 			elseif op == OP_UP_TERM then
 				local src = code[off + 4]
-				local row, column = traverse_up(
-					components_lookup,
-					sparse,
-					PAIR_SECOND,
-					reachable,
-					var_arch[src],
-					code[off + 5],
-					code[off + 6],
-					code[off + 8] == 1
-				)
+				local row, column =
+					traverse_up(var_arch[src], var_ent[src], code[off + 5], code[off + 6], code[off + 8] == 1)
 				if column then
 					local out = code[off + 7]
 					if row == 0 then
@@ -1447,16 +1771,9 @@ local function iter_program(query: QueryInternal, list: { Archetype }, probe: bo
 			elseif op == OP_WITHOUT then
 				ok = var_arch[code[off + 4]].columns_map[code[off + 5]] == nil
 			elseif op == OP_UP_WITH or op == OP_UP_WITHOUT then
-				local _, column = traverse_up(
-					components_lookup,
-					sparse,
-					PAIR_SECOND,
-					reachable,
-					var_arch[code[off + 4]],
-					code[off + 5],
-					code[off + 6],
-					code[off + 7] == 1
-				)
+				local src = code[off + 4]
+				local _, column =
+					traverse_up(var_arch[src], var_ent[src], code[off + 5], code[off + 6], code[off + 7] == 1)
 				ok = if op == OP_UP_WITH then column ~= nil else column == nil
 			elseif op == OP_TARGET_BOUND or op == OP_TARGET_BOUND_NOT then
 				local src = code[off + 4]
@@ -1473,21 +1790,6 @@ local function iter_program(query: QueryInternal, list: { Archetype }, probe: bo
 					ok = true
 				else
 					ok = false
-				end
-			elseif op == OP_EACH_THIS then
-				local entities = var_arch[THIS_VAR].entities
-				local count = #entities
-				local row = if redo then ctx[pc * 2 - 1] - 1 else count
-				if row > count then
-					row = count
-				end
-				if row < 1 then
-					ok = false
-				else
-					ctx[pc * 2 - 1] = row
-					var_ent[THIS_VAR], var_row[THIS_VAR] = entities[row] :: any, row
-					res_lo, res_hi = row, row
-					ok = true
 				end
 			elseif op == OP_FROM_SELECT or op == OP_FROM_SELECT_PAIR then
 				local var = code[off + 4]
@@ -1812,7 +2114,14 @@ end
 local query_mt = {}
 query_mt.__index = query_mt
 
+local function assert_archetype_driven(query: QueryInternal, method: string)
+	if query.sparse_driver then
+		error(`:{method}() is not available on a query driven by a DontFragment term`)
+	end
+end
+
 local function query_rematch(query: QueryInternal): { Archetype }
+	assert_archetype_driven(query, "rematch")
 	if query.is_cached then
 		return query.compatible_archetypes :: { Archetype }
 	end
@@ -1973,6 +2282,7 @@ local function cascade_sort(query: QueryInternal, list: { Archetype }): { Archet
 end
 
 local function query_archetypes_ordered(query: QueryInternal): { Archetype }
+	assert_archetype_driven(query, "archetypes")
 	local list = query_archetypes(query)
 	if query.cascade and #list > 1 then
 		return cascade_sort(query, list)
@@ -1981,6 +2291,7 @@ local function query_archetypes_ordered(query: QueryInternal): { Archetype }
 end
 
 local function query_match(query: QueryInternal, archetype: Archetype): boolean
+	assert_archetype_driven(query, "match")
 	local map = query.compatible_archetypes_map
 	if map then
 		return map[archetype.archetype_id] ~= nil
@@ -1988,7 +2299,13 @@ local function query_match(query: QueryInternal, archetype: Archetype): boolean
 	return query.prematcher.match(archetype)
 end
 
+-- a sparse driven program never reads the archetype list
+local SPARSE_DRIVER_LIST: { Archetype } = table.freeze {} :: any
+
 local function query_iter(query: QueryInternal): () -> ...any
+	if query.sparse_driver then
+		return iter_program(query, SPARSE_DRIVER_LIST)
+	end
 	local list = query_archetypes_ordered(query)
 	if #list == 0 then
 		return NOOP
@@ -2000,7 +2317,8 @@ local function query_iter(query: QueryInternal): () -> ...any
 end
 
 local function query_cached(query: QueryInternal): QueryInternal
-	if query.is_cached then
+	-- nothing to cache: the sparse set is the live result list
+	if query.is_cached or query.sparse_driver then
 		return query
 	end
 	local prematcher = query.prematcher
@@ -2051,6 +2369,10 @@ local function query_monitor(query: QueryInternal): types.Monitor
 
 	if query.is_static then
 		return internal.monitor_new(world, prematcher.with_ids, without_ids)
+	end
+	-- monitors compare archetypes, which DontFragment pairs are not part of
+	if query.has_sparse then
+		error "monitor() is not supported on queries with DontFragment terms"
 	end
 	if query.per_entity then
 		error "monitor() is not supported on queries that bind $this per entity"

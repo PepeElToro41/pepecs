@@ -50,6 +50,7 @@ type HierarchyNode = types.HierarchyNode
 
 export type PairRecord = types.PairRecord
 export type ComponentRecord = types.ComponentRecord
+type SparseSet = types.SparseSet
 export type ComponentsLookup = types.ComponentsLookup
 export type EntityIndex = types.EntityIndex
 export type WorldInternal = types.WorldInternal
@@ -85,13 +86,17 @@ local ECS_TRAVERSABLE = 	   MAX_COMPONENT_ID + 10
 local ECS_DISABLED = 		   MAX_COMPONENT_ID + 11
 local ECS_FORCE_TAG = 	   MAX_COMPONENT_ID + 12
 local ECS_TRANSITIVE = 	   MAX_COMPONENT_ID + 13
-local ECS_REST = 			   MAX_COMPONENT_ID + 14
+local ECS_DONT_FRAGMENT =    MAX_COMPONENT_ID + 14
+local ECS_REST = 			   MAX_COMPONENT_ID + 15
 -- stylua: ignore end
 
 local IS_COMPONENT_FLAG = bit32.lshift(1, 0)
 local IS_EXCLUSIVE_FLAG = bit32.lshift(1, 1)
 local IS_TRAVERSABLE_FLAG = bit32.lshift(1, 3)
 local HAS_DELETE_FLAG = bit32.lshift(1, 2)
+-- pairs of the relation live in sparse storage on their records instead of
+-- fragmenting archetypes (see the DontFragment section of world_new)
+local IS_DONT_FRAGMENT_FLAG = bit32.lshift(1, 4)
 
 local NULL_ARRAY = table.freeze {} :: { any }
 -- hop limit of the slow (non traversable) chain walk, matches the engine
@@ -237,6 +242,57 @@ local function REMOVE_ALL_PAIRS(components: { u53 }, components_count: number, p
 	end
 
 	return destination_ids
+end
+
+-------------------------------------------------------------------------------
+-- sparse storage (DontFragment pairs)
+-------------------------------------------------------------------------------
+
+-- A dense list of entities plus an entity id -> slot index, with a values
+-- column aligned to the dense list (NULL_ARRAY when the pair is a tag).
+local function SPARSE_NEW(has_values: boolean): SparseSet
+	return {
+		dense = {},
+		index = {},
+		values = if has_values then {} else NULL_ARRAY,
+	}
+end
+
+local function SPARSE_INSERT(set: SparseSet, entity: u53, value: any): number
+	local dense = set.dense
+	local slot = #dense + 1
+	dense[slot] = entity
+	set.index[ENTITY_ID(entity)] = slot
+	local values = set.values
+	if values ~= NULL_ARRAY then
+		values[slot] = value
+	end
+	return slot
+end
+
+-- swap-removes the entity, keeping the values column aligned
+local function SPARSE_REMOVE(set: SparseSet, entity_id: u24)
+	local index = set.index
+	local slot = index[entity_id]
+	if not slot then
+		return
+	end
+	local dense = set.dense
+	local values = set.values
+	local last = #dense
+	if slot ~= last then
+		local moved = dense[last]
+		dense[slot] = moved
+		index[ENTITY_ID(moved)] = slot
+		if values ~= NULL_ARRAY then
+			values[slot] = values[last]
+		end
+	end
+	dense[last] = nil
+	if values ~= NULL_ARRAY then
+		values[last] = nil
+	end
+	index[entity_id] = nil
 end
 
 local function FIRE_SET_HOOKS(all_hooks: Array<{ SetHook }>, entity: u53, id: u53, data: any)
@@ -932,6 +988,10 @@ end
 local query_mt = {}
 query_mt.__index = query_mt
 
+-- set below, with the fallback metatable
+local HAS_DONT_FRAGMENT_ID: (world: World, ids: { u53 }) -> boolean
+local fallback_mt: { [string]: any }
+
 local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, without_ids: { u53 }?): Query<any>
 	local query = {
 		is_cached = false,
@@ -941,6 +1001,12 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 		without_ids = without_ids,
 		world = world,
 	}
+
+	-- DontFragment pairs are invisible to the archetype path: delegate to the
+	-- query engine instead
+	if HAS_DONT_FRAGMENT_ID(world, with_ids) or (without_ids ~= nil and HAS_DONT_FRAGMENT_ID(world, without_ids)) then
+		return setmetatable(query, fallback_mt) :: any
+	end
 
 	return setmetatable(query, query_mt) :: any
 end
@@ -963,6 +1029,9 @@ local function query_with(query: QueryInternal, ...: u53)
 	local ids = { ... }
 	local with_ids = query.with_ids
 	table.move(ids, 1, #ids, #with_ids + 1, with_ids)
+	if HAS_DONT_FRAGMENT_ID(query.world, ids) then
+		setmetatable(query :: any, fallback_mt)
+	end
 	return query
 end
 
@@ -977,6 +1046,9 @@ local function query_without(query: QueryInternal, ...: u53)
 		table.move(ids, 1, #ids, #without_ids + 1, without_ids)
 	else
 		query.without_ids = ids
+	end
+	if HAS_DONT_FRAGMENT_ID(query.world, ids) then
+		setmetatable(query :: any, fallback_mt)
 	end
 	return query
 end
@@ -2273,6 +2345,206 @@ query_mt.monitor = query_monitor
 query_mt.observe = query_observe
 query_mt.changed = query_changed
 
+-------------------------------------------------------------------------------
+-- world.query fallback for DontFragment pairs
+--
+-- Such pairs are not part of any archetype, so the archetype based query
+-- cannot see them. A query holding one swaps its metatable to this one, which
+-- compiles the same terms with the query engine and delegates to it. Only
+-- the iteration shaped methods are available.
+-------------------------------------------------------------------------------
+
+function HAS_DONT_FRAGMENT_ID(world: World, ids: { u53 }): boolean
+	local components_lookup = world.components_lookup
+	local internal = world.internal
+	for _, id in ids do
+		if not IS_PAIR(id) then
+			continue
+		end
+		local relation_record = components_lookup[ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)]
+		if relation_record then
+			if CHECK_FLAG(relation_record.flags, IS_DONT_FRAGMENT_FLAG) then
+				return true
+			end
+		else
+			-- no pair of the relation exists yet: read the trait itself
+			local relation = internal.get_entity_alive(PAIR_FIRST(id))
+			if relation and relation ~= ECS_WILDCARD and (world.has :: any)(relation, ECS_DONT_FRAGMENT) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+type FallbackQuery = QueryInternal & { engine_query: EngineQuery? }
+
+fallback_mt = {}
+fallback_mt.__index = fallback_mt
+
+local function fallback_engine(query: FallbackQuery): EngineQuery
+	local existing = query.engine_query
+	if existing then
+		return existing
+	end
+
+	local builder = query.world.query_build()
+	local in_terms: Map<u53, boolean> = {}
+	for _, id in query.terms do
+		builder:term(id)
+		in_terms[id] = true
+	end
+	for _, id in query.with_ids do
+		if not in_terms[id] then
+			builder:with(id)
+		end
+	end
+	local without_ids = query.without_ids
+	if without_ids then
+		for _, id in without_ids do
+			builder:without(id)
+		end
+	end
+
+	local built = builder:build()
+	if query.is_cached then
+		built:cached()
+	end
+	query.engine_query = built
+	return built
+end
+
+local function fallback_unsupported(method: string)
+	return function()
+		error(`query:{method}() is not supported on a query with DontFragment pairs, use world.query_build()`)
+	end
+end
+
+function fallback_mt.with(query: FallbackQuery, ...: u53)
+	if query.engine_query then
+		error "cannot add terms to a query after it has been matched"
+	end
+	local ids = { ... }
+	table.move(ids, 1, #ids, #query.with_ids + 1, query.with_ids)
+	return query
+end
+
+function fallback_mt.without(query: FallbackQuery, ...: u53)
+	if query.engine_query then
+		error "cannot add terms to a query after it has been matched"
+	end
+	local ids = { ... }
+	local without_ids = query.without_ids
+	if without_ids then
+		table.move(ids, 1, #ids, #without_ids + 1, without_ids)
+	else
+		query.without_ids = ids
+	end
+	return query
+end
+
+function fallback_mt.clone(query: FallbackQuery)
+	return query_clone(query)
+end
+
+function fallback_mt.iter(query: FallbackQuery)
+	return fallback_engine(query):iter()
+end
+fallback_mt.__iter = fallback_mt.iter
+
+function fallback_mt.cached(query: FallbackQuery)
+	query.is_cached = true
+	local built = query.engine_query
+	if built then
+		built:cached()
+	end
+	return query
+end
+
+function fallback_mt.cleanup(query: FallbackQuery)
+	query.is_cached = false
+	local built = query.engine_query
+	if built then
+		built:cleanup()
+	end
+end
+
+function fallback_mt.has(query: FallbackQuery, entity: u53): boolean
+	local world = query.world
+	if not world.internal.get_entity_record_alive(entity) then
+		return false
+	end
+	local has: (u53, u53) -> boolean = world.has :: any
+	for _, id in query.with_ids do
+		if not has(entity, id) then
+			return false
+		end
+	end
+	local without_ids = query.without_ids
+	if without_ids then
+		for _, id in without_ids do
+			if has(entity, id) then
+				return false
+			end
+		end
+	end
+	return true
+end
+
+function fallback_mt.entities(query: FallbackQuery): { Entity }
+	local entities = {}
+	for entity in fallback_engine(query):iter() do
+		table.insert(entities, entity)
+	end
+	return entities
+end
+
+function fallback_mt.count(query: FallbackQuery): number
+	local count = 0
+	for _ in fallback_engine(query):iter() do
+		count += 1
+	end
+	return count
+end
+
+function fallback_mt.empty(query: FallbackQuery): boolean
+	return fallback_engine(query):iter()() == nil
+end
+
+function fallback_mt.random(query: FallbackQuery): Entity?
+	local entities = fallback_mt.entities(query)
+	local count = #entities
+	if count == 0 then
+		return nil
+	end
+	return entities[math.random(1, count)]
+end
+
+function fallback_mt.first(query: FallbackQuery, predicator: ((Entity, ...any) -> boolean)?): ...any
+	local iter = fallback_engine(query):iter()
+	if not predicator then
+		return iter()
+	end
+	while true do
+		local results = table.pack(iter())
+		if results[1] == nil then
+			return nil
+		end
+		if predicator(unpack(results, 1, results.n)) then
+			return unpack(results, 1, results.n)
+		end
+	end
+end
+
+fallback_mt.match = fallback_unsupported "match"
+fallback_mt.archetypes = fallback_unsupported "archetypes"
+fallback_mt.rematch = fallback_unsupported "rematch"
+fallback_mt.columns = fallback_unsupported "columns"
+fallback_mt.patch = fallback_unsupported "patch"
+fallback_mt.monitor = fallback_unsupported "monitor"
+fallback_mt.observe = fallback_unsupported "observe"
+fallback_mt.changed = fallback_unsupported "changed"
+
 local function world_new()
 	local dense_arr = {}
 	local sparse_arr = {}
@@ -2288,6 +2560,11 @@ local function world_new()
 	local archetype_creation_observers: Map<u53, { ArchetypeObserver }> = {}
 	local archetype_destruction_observers: Map<u53, { ArchetypeObserver }> = {}
 
+	-- (R, *) records of every DontFragment relation that has been used, so
+	-- clear/delete and the reachable cache can enumerate an entity's sparse
+	-- pairs. Always consulted behind a `record.sparse_count > 0` gate.
+	local dont_fragment_records: Map<u53, PairRecord> = {}
+
 	local entity_index: EntityIndex = {
 		dense = dense_arr,
 		sparse = sparse_arr,
@@ -2297,6 +2574,7 @@ local function world_new()
 	local hierarchy: Hierarchy = hierarchy_new {
 		entity_index = entity_index,
 		components_lookup = components_lookup,
+		dont_fragment_records = dont_fragment_records,
 		ECS_PAIR = ECS_PAIR,
 		PAIR_SECOND = PAIR_SECOND,
 		ECS_WILDCARD = ECS_WILDCARD,
@@ -2389,6 +2667,7 @@ local function world_new()
 				archetype_row = -1,
 				deleting = false,
 				targets = 0,
+				sparse_count = 0,
 			}
 			table.insert(sparse_arr, new_record)
 			table.insert(dense_arr, next_id)
@@ -2428,6 +2707,10 @@ local function world_new()
 		return column[row]
 	end
 
+	-- forward declared: DontFragment helpers are defined inside world_new after
+	-- the archetype code, but has/get need them for entities holding such pairs
+	local dont_fragment_slot: (entity_id: u24, id: u53) -> (SparseSet?, number?)
+
 	local function world_has(entity: u53, id: u53)
 		local record = get_entity_record_asserts_alive(entity)
 		if not record then
@@ -2435,7 +2718,40 @@ local function world_new()
 		end
 
 		local archetype = record.archetype
-		return archetype.columns_map[id] ~= nil
+		if archetype.columns_map[id] ~= nil then
+			return true
+		end
+		if record.sparse_count == 0 or not IS_PAIR(id) then
+			return false
+		end
+		return dont_fragment_slot(ENTITY_ID(entity), id) ~= nil
+	end
+
+	-- world_get for an entity holding DontFragment pairs: every id may live in
+	-- the archetype or in sparse storage
+	local function get_with_sparse(entity_id: u24, columns_map: { [u53]: Column }, row: number, ...: u53): ...any
+		local ids = table.pack(...)
+		-- world_get forwards its fixed parameters, so the tail may be nil
+		local count = 0
+		for index = 1, ids.n do
+			if ids[index] == nil then
+				break
+			end
+			count = index
+		end
+		for index = 1, count do
+			local id = ids[index]
+			local column = columns_map[id]
+			if column then
+				ids[index] = column[row]
+			elseif IS_PAIR(id) then
+				local sparse, slot = dont_fragment_slot(entity_id, id)
+				ids[index] = if sparse then sparse.values[slot :: number] else nil
+			else
+				ids[index] = nil
+			end
+		end
+		return unpack(ids, 1, count)
 	end
 
 	local function world_get(
@@ -2456,6 +2772,35 @@ local function world_new()
 			return nil
 		end
 		local archetype = record.archetype
+		if record.sparse_count > 0 then
+			if not b then
+				-- single id: archetype first, then sparse storage
+				local column = archetype.columns_map[a]
+				if column then
+					return column[record.archetype_row]
+				end
+				if not IS_PAIR(a) then
+					return nil
+				end
+				local sparse, slot = dont_fragment_slot(ENTITY_ID(entity), a)
+				return if sparse then sparse.values[slot :: number] else nil
+			end
+			return get_with_sparse(
+				ENTITY_ID(entity),
+				archetype.columns_map,
+				record.archetype_row,
+				a,
+				b,
+				c,
+				d,
+				e,
+				f,
+				g,
+				h,
+				i,
+				...
+			)
+		end
 		if archetype == ROOT_ARCHETYPE then
 			return nil
 		end
@@ -2542,6 +2887,7 @@ local function world_new()
 		local relation = id
 		local is_exclusive = false
 		local is_traversable = false
+		local is_dont_fragment = false
 		local has_delete = false
 		local target: u53? = nil
 
@@ -2574,6 +2920,7 @@ local function world_new()
 			end
 			is_exclusive = world_has(relation, ECS_EXCLUSIVE)
 			is_traversable = world_has(relation, ECS_TRAVERSABLE)
+			is_dont_fragment = world_has(relation, ECS_DONT_FRAGMENT)
 
 			local pair_record = record :: PairRecord
 			pair_record.pairs_count = {}
@@ -2581,6 +2928,9 @@ local function world_new()
 			pair_record.second_records = {}
 			pair_record.trav_records = {}
 		else
+			if world_has(id, ECS_DONT_FRAGMENT) then
+				error "DontFragment is only supported on relations"
+			end
 			-- plain component/tag: consulted when the id itself is deleted
 			has_delete = world_has(id, ECS_PAIR(ECS_ON_DELETE, ECS_DELETE))
 		end
@@ -2591,8 +2941,19 @@ local function world_new()
 			(is_component and IS_COMPONENT_FLAG) or 0,
 			(has_delete and HAS_DELETE_FLAG) or 0,
 			(is_exclusive and IS_EXCLUSIVE_FLAG) or 0,
-			(is_traversable and IS_TRAVERSABLE_FLAG) or 0
+			(is_traversable and IS_TRAVERSABLE_FLAG) or 0,
+			(is_dont_fragment and IS_DONT_FRAGMENT_FLAG) or 0
 		)
+
+		if is_dont_fragment then
+			local pair_record = record :: PairRecord
+			-- (R, T) stores values, (R, *) stores the per entity list of pair ids
+			local is_wildcard = PAIR_SECOND(id) == ECS_WILDCARD
+			pair_record.sparse = SPARSE_NEW(is_wildcard or is_component)
+			if is_wildcard then
+				dont_fragment_records[id] = pair_record
+			end
+		end
 
 		components_lookup[id] = record
 		return record
@@ -2876,7 +3237,7 @@ local function world_new()
 			destination.alive = true
 		end
 		if record.targets > 0 then
-			hierarchy_moved(record, destination)
+			hierarchy_moved(record)
 		end
 	end
 
@@ -2885,7 +3246,7 @@ local function world_new()
 		record.archetype = archetype
 		record.archetype_row = assigned_row
 		if record.targets > 0 then
-			hierarchy_moved(record, archetype)
+			hierarchy_moved(record)
 		end
 	end
 
@@ -3025,6 +3386,12 @@ local function world_new()
 				local target_wildcard = ECS_PAIR(ECS_WILDCARD, PAIR_SECOND(id))
 
 				local relation_record = components_lookup[relation_wildcard] :: PairRecord
+
+				-- sanity check: DontFragment pairs live in sparse storage and must
+				-- never reach the archetype graph
+				if CHECK_FLAG(relation_record.flags, IS_DONT_FRAGMENT_FLAG) then
+					error "a DontFragment pair cannot be stored in an archetype"
+				end
 
 				if CHECK_FLAG(relation_record.flags, IS_TRAVERSABLE_FLAG) then
 					traversable_count += 1
@@ -3167,7 +3534,7 @@ local function world_new()
 				record.archetype = ROOT_ARCHETYPE
 				record.archetype_row = -1
 				if record.targets > 0 then
-					hierarchy_moved(record, ROOT_ARCHETYPE)
+					hierarchy_moved(record)
 				end
 			end
 		else
@@ -3176,7 +3543,7 @@ local function world_new()
 				record.archetype = destination
 				record.archetype_row = destination_last_row + row
 				if record.targets > 0 then
-					hierarchy_moved(record, destination)
+					hierarchy_moved(record)
 				end
 			end
 
@@ -3212,6 +3579,282 @@ local function world_new()
 		return get_new_entity_id()
 	end
 
+	---------------------------------------------------------------------------
+	-- DontFragment
+	--
+	-- Pairs of a relation with the DontFragment trait never touch the
+	-- archetype graph. The (R, T) record keeps a sparse set of holders and
+	-- their values, the (R, *) record keeps, per holder, the sorted list of
+	-- (R, T) pair ids. `record.sparse_count` gates every lookup so entities
+	-- without such pairs pay nothing beyond a counter check on a miss.
+	--
+	-- Hooks (added/changed/removed) fire like for any id. Monitors and
+	-- observers compare archetypes and are not fired for these pairs.
+	---------------------------------------------------------------------------
+
+	local world_delete_recursive: (entity: u53) -> ()
+
+	-- (R, *) record of a pair id when its relation is DontFragment, nil otherwise
+	local function dont_fragment_relation(id: u53): PairRecord?
+		local relation_record = components_lookup[ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)] :: PairRecord
+		if relation_record and CHECK_FLAG(relation_record.flags, IS_DONT_FRAGMENT_FLAG) then
+			return relation_record
+		end
+		return nil
+	end
+
+	-- Sparse set and slot holding `id` for the entity, nil when it does not.
+	-- (R, *) resolves to the first pair of R, (*, T) to the first DontFragment
+	-- pair targeting T, mirroring what columns_map does for wildcards.
+	function dont_fragment_slot(entity_id: u24, id: u53): (SparseSet?, number?)
+		local first = PAIR_FIRST(id)
+		if first == ECS_WILDCARD then
+			local target_record = components_lookup[id] :: PairRecord
+			if not target_record then
+				return nil, nil
+			end
+			for _, pair_record in target_record.second_records do
+				local pair_sparse = pair_record.sparse
+				if pair_sparse then
+					local slot = pair_sparse.index[entity_id]
+					if slot then
+						return pair_sparse, slot
+					end
+				end
+			end
+			return nil, nil
+		end
+
+		local pair_record = components_lookup[id] :: PairRecord
+		local pair_sparse = pair_record and pair_record.sparse
+		if not pair_sparse then
+			return nil, nil
+		end
+		local slot = pair_sparse.index[entity_id]
+		if not slot then
+			return nil, nil
+		end
+		if PAIR_SECOND(id) == ECS_WILDCARD then
+			local first_pair = pair_sparse.values[slot][1]
+			local first_record = components_lookup[first_pair] :: PairRecord
+			local first_sparse = first_record.sparse :: SparseSet
+			return first_sparse, first_sparse.index[entity_id]
+		end
+		return pair_sparse, slot
+	end
+
+	-- first (R, T) pair of the entity, from its archetype or the sparse storage
+	local function first_pair_of(record: EntityRecord, relation_record: PairRecord): u53?
+		local relation_sparse = relation_record.sparse
+		if relation_sparse then
+			local slot = relation_sparse.index[ENTITY_ID(dense_arr[record.dense])]
+			return if slot then relation_sparse.values[slot][1] else nil
+		end
+		local archetype = record.archetype
+		local index = relation_record.column_index[archetype.archetype_id]
+		return if index then archetype.components[index] else nil
+	end
+
+	-- Storage only, no hooks. Callers relink the hierarchy once they are done
+	-- (`record.targets > 0`), since a swap touches the storage twice.
+	local function sparse_pair_insert(
+		entity: u53,
+		record: EntityRecord,
+		relation_record: PairRecord,
+		pair_record: PairRecord,
+		id: u53,
+		value: any
+	)
+		local relation_sparse = relation_record.sparse :: SparseSet
+		local slot = relation_sparse.index[ENTITY_ID(entity)]
+		if slot then
+			local list = relation_sparse.values[slot] :: { u53 }
+			table.insert(list, FIND_INSERT(list, id), id)
+		else
+			SPARSE_INSERT(relation_sparse, entity, { id })
+		end
+		SPARSE_INSERT(pair_record.sparse :: SparseSet, entity, value)
+		record.sparse_count += 1
+	end
+
+	local function sparse_pair_remove(
+		entity: u53,
+		record: EntityRecord,
+		relation_record: PairRecord,
+		pair_record: PairRecord,
+		id: u53
+	)
+		local entity_id = ENTITY_ID(entity)
+		SPARSE_REMOVE(pair_record.sparse :: SparseSet, entity_id)
+
+		local relation_sparse = relation_record.sparse :: SparseSet
+		local slot = relation_sparse.index[entity_id]
+		local list = relation_sparse.values[slot] :: { u53 }
+		if #list == 1 then
+			SPARSE_REMOVE(relation_sparse, entity_id)
+		else
+			table.remove(list, table.find(list, id))
+		end
+		record.sparse_count -= 1
+	end
+
+	-- add/set of a DontFragment pair. `set_value` is true for world.set, so a
+	-- held pair is updated (changed hooks) instead of ignored.
+	local function dont_fragment_set(
+		entity: u53,
+		record: EntityRecord,
+		relation_record: PairRecord,
+		id: u53,
+		set_value: boolean,
+		value: any
+	)
+		local pair_record = component_record_ensure(id) :: PairRecord
+		local pair_sparse = pair_record.sparse :: SparseSet
+		local entity_id = ENTITY_ID(entity)
+
+		if set_value and pair_sparse.values == NULL_ARRAY then
+			error "cannot set a value on a tag, use world.add instead"
+		end
+
+		local slot = pair_sparse.index[entity_id]
+		if slot then
+			if not set_value then
+				return
+			end
+			pair_sparse.values[slot] = value
+			local changed_hooks = pair_record.on_changed
+			if changed_hooks then
+				FIRE_SET_HOOKS(changed_hooks, entity, id, value)
+			end
+			return
+		end
+
+		-- exclusive relation: the held pair is swapped out first
+		local post_removed: { () -> () }? = nil
+		if CHECK_FLAG(relation_record.flags, IS_EXCLUSIVE_FLAG) then
+			local relation_sparse = relation_record.sparse :: SparseSet
+			local relation_slot = relation_sparse.index[entity_id]
+			if relation_slot then
+				local swapped_id = relation_sparse.values[relation_slot][1]
+				local swapped_record = components_lookup[swapped_id] :: PairRecord
+				local removed_hooks = swapped_record.on_removed
+				if removed_hooks then
+					post_removed = FIRE_REMOVE_HOOKS(removed_hooks, entity, swapped_id)
+				end
+				sparse_pair_remove(entity, record, relation_record, swapped_record, swapped_id)
+			end
+		end
+
+		sparse_pair_insert(entity, record, relation_record, pair_record, id, value)
+		if record.targets > 0 then
+			hierarchy_moved(record)
+		end
+
+		local added_hooks = pair_record.on_added
+		if added_hooks then
+			FIRE_SET_HOOKS(added_hooks, entity, id, value)
+		end
+
+		if post_removed then
+			for _, callback in post_removed do
+				callback()
+			end
+		end
+	end
+
+	-- removes one DontFragment pair with its hooks. Returns false when the
+	-- entity does not hold it.
+	local function dont_fragment_remove(
+		entity: u53,
+		record: EntityRecord,
+		relation_record: PairRecord,
+		id: u53,
+		relink: boolean
+	): boolean
+		local pair_record = components_lookup[id] :: PairRecord
+		local pair_sparse = pair_record and pair_record.sparse
+		if not pair_sparse or not pair_sparse.index[ENTITY_ID(entity)] then
+			return false
+		end
+
+		local removed_hooks = pair_record.on_removed
+		local post_removed = removed_hooks and FIRE_REMOVE_HOOKS(removed_hooks, entity, id) or nil
+
+		-- a hook may have removed the pair itself
+		if pair_sparse.index[ENTITY_ID(entity)] then
+			sparse_pair_remove(entity, record, relation_record, pair_record, id)
+			if relink and record.targets > 0 then
+				hierarchy_moved(record)
+			end
+		end
+
+		if post_removed then
+			for _, callback in post_removed do
+				callback()
+			end
+		end
+		return true
+	end
+
+	-- every DontFragment pair the entity holds, across relations
+	local function dont_fragment_collect(entity_id: u24): { u53 }
+		local out: { u53 } = {}
+		for _, relation_record in dont_fragment_records do
+			local relation_sparse = relation_record.sparse :: SparseSet
+			local slot = relation_sparse.index[entity_id]
+			if slot then
+				table.move(relation_sparse.values[slot], 1, #relation_sparse.values[slot], #out + 1, out)
+			end
+		end
+		return out
+	end
+
+	-- Removes every DontFragment pair of the entity. Hooks fire first for all
+	-- pairs, then the storage is updated, matching clear_entity_components.
+	local function dont_fragment_clear(entity: u53, record: EntityRecord, post_removed: { () -> () }?): { () -> () }?
+		local entity_id = ENTITY_ID(entity)
+		local pairs = dont_fragment_collect(entity_id)
+
+		for _, id in pairs do
+			local pair_record = components_lookup[id]
+			local removed_hooks = pair_record and pair_record.on_removed
+			if removed_hooks then
+				post_removed = FIRE_REMOVE_HOOKS(removed_hooks, entity, id, post_removed)
+			end
+		end
+
+		for _, id in pairs do
+			local pair_record = components_lookup[id] :: PairRecord
+			local pair_sparse = pair_record and pair_record.sparse
+			-- a hook may have removed it already
+			if pair_sparse and pair_sparse.index[entity_id] then
+				local relation_record = components_lookup[ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)] :: PairRecord
+				sparse_pair_remove(entity, record, relation_record, pair_record, id)
+			end
+		end
+		return post_removed
+	end
+
+	-- Drains every holder of a DontFragment (R, T) record: deletes them when
+	-- `delete_holders`, otherwise removes the pair. Used when R or T dies.
+	local function dont_fragment_drain(pair_record: PairRecord, id: u53, delete_holders: boolean)
+		local relation_record = components_lookup[ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)] :: PairRecord
+		local dense = (pair_record.sparse :: SparseSet).dense
+		while #dense > 0 do
+			local holder = dense[#dense]
+			local holder_record = sparse_arr[ENTITY_ID(holder)]
+			if delete_holders then
+				world_delete_recursive(holder)
+			else
+				dont_fragment_remove(holder, holder_record, relation_record, id, true)
+			end
+			-- a hook that re-adds the pair must not spin the drain forever
+			if dense[#dense] == holder then
+				sparse_pair_remove(holder, holder_record, relation_record, pair_record, id)
+			end
+		end
+	end
+
 	local function world_set(entity: u53, id: u53, data: any)
 		local record = get_entity_record_alive(entity)
 		if not record then
@@ -3241,6 +3884,15 @@ local function world_new()
 				FIRE_SET_HOOKS(changed_hooks, entity, id, data)
 			end
 		else
+			-- DontFragment pairs live in sparse storage, never in an archetype
+			if IS_PAIR(id) then
+				local relation_record = wildcard_record_ensure(ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD))
+				if CHECK_FLAG(relation_record.flags, IS_DONT_FRAGMENT_FLAG) then
+					dont_fragment_set(entity, record, relation_record, id, true, data)
+					return
+				end
+			end
+
 			-- resolve the record up front so a tag is rejected before the entity
 			-- is moved into a new archetype
 			local id_record = component_record_ensure(id)
@@ -3347,9 +3999,15 @@ local function world_new()
 		if IS_PAIR(id) then
 			local relation = PAIR_FIRST(id)
 			local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
-			local relation_record = components_lookup[relation_wildcard] :: PairRecord
+			local relation_record = wildcard_record_ensure(relation_wildcard)
 
-			if relation_record and CHECK_FLAG(relation_record.flags, IS_EXCLUSIVE_FLAG) then
+			-- DontFragment pairs live in sparse storage, never in an archetype
+			if CHECK_FLAG(relation_record.flags, IS_DONT_FRAGMENT_FLAG) then
+				dont_fragment_set(entity, record, relation_record, id, false, nil)
+				return
+			end
+
+			if CHECK_FLAG(relation_record.flags, IS_EXCLUSIVE_FLAG) then
 				local column_index = relation_record.column_index[source.archetype_id]
 
 				if column_index then
@@ -3368,6 +4026,12 @@ local function world_new()
 				destination = archetype_find_with(source, id)
 			end
 		else
+			-- the trait must be set before the relation is used: records cache
+			-- it in their flags and a late switch would split one relation
+			-- between both storages
+			if id == ECS_DONT_FRAGMENT and components_lookup[ECS_PAIR(entity, ECS_WILDCARD)] then
+				error "DontFragment must be added before the relation is used in a pair"
+			end
 			destination = archetype_find_with(source, id)
 		end
 
@@ -3425,6 +4089,12 @@ local function world_new()
 
 		local source = record.archetype
 		if not source.columns_map[id] then
+			if record.sparse_count > 0 and IS_PAIR(id) then
+				local relation_record = dont_fragment_relation(id)
+				if relation_record then
+					dont_fragment_remove(entity, record, relation_record, id, true)
+				end
+			end
 			return
 		end
 
@@ -3438,7 +4108,7 @@ local function world_new()
 			record.archetype = ROOT_ARCHETYPE
 			record.archetype_row = -1
 			if record.targets > 0 then
-				hierarchy_moved(record, ROOT_ARCHETYPE)
+				hierarchy_moved(record)
 			end
 		else
 			archetype_move_entity(entity, record, source, destination)
@@ -3610,6 +4280,9 @@ local function world_new()
 		end
 	end
 
+	-- Removes every id of the entity: its archetype components and its
+	-- DontFragment pairs. Callers gate on `archetype ~= ROOT_ARCHETYPE or
+	-- sparse_count > 0`.
 	local function clear_entity_components(entity: u53, record: EntityRecord)
 		local archetype = record.archetype
 		local post_removed_callbacks: { () -> () }?
@@ -3626,11 +4299,19 @@ local function world_new()
 			end
 		end
 
-		archetype_delete_entity(archetype, record.archetype_row)
-		record.archetype = ROOT_ARCHETYPE
-		record.archetype_row = -1
+		if record.sparse_count > 0 then
+			post_removed_callbacks = dont_fragment_clear(entity, record, post_removed_callbacks)
+		end
+
+		-- hooks may have moved the entity already
+		archetype = record.archetype
+		if archetype ~= ROOT_ARCHETYPE then
+			archetype_delete_entity(archetype, record.archetype_row)
+			record.archetype = ROOT_ARCHETYPE
+			record.archetype_row = -1
+		end
 		if record.targets > 0 then
-			hierarchy_moved(record, ROOT_ARCHETYPE)
+			hierarchy_moved(record)
 		end
 
 		for _, id in archetype.components do
@@ -3667,6 +4348,7 @@ local function world_new()
 				components_lookup[pair_id] = nil
 			end
 			components_lookup[relation_wildcard] = nil
+			dont_fragment_records[relation_wildcard] = nil
 		end
 
 		local target_wildcard = ECS_PAIR(ECS_WILDCARD, entity)
@@ -3684,8 +4366,6 @@ local function world_new()
 			components_lookup[target_wildcard] = nil
 		end
 	end
-
-	local world_delete_recursive: (entity: u53) -> ()
 
 	-- Deletes every entity of an archetype flagged for cascade deletion. Drains
 	-- from the end so that entities appended by a nested cascade are visited,
@@ -3717,7 +4397,7 @@ local function world_new()
 			-- the caller is about to destroy the archetype this entity lives in
 			-- and release its pair records, so the entity must leave it now while
 			-- those records still exist.
-			if record.archetype ~= ROOT_ARCHETYPE then
+			if record.archetype ~= ROOT_ARCHETYPE or record.sparse_count > 0 then
 				clear_entity_components(entity, record)
 			end
 			return
@@ -3818,6 +4498,26 @@ local function world_new()
 				table.clear(removing)
 				archetype_destroy(archetype)
 			end
+
+			-- DontFragment pairs targeting the entity have no archetype: drain
+			-- their sparse sets. Snapshot first, cascaded deletes can release
+			-- records out of second_records while we walk it.
+			local sparse_pairs: { u53 }? = nil
+			for pair_id, pair_record in target_record.second_records do
+				if pair_record.sparse then
+					sparse_pairs = sparse_pairs or {}
+					table.insert(sparse_pairs :: { u53 }, pair_id)
+				end
+			end
+			if sparse_pairs then
+				for _, pair_id in sparse_pairs do
+					local pair_record = components_lookup[pair_id] :: PairRecord
+					if pair_record and pair_record.sparse then
+						-- (R, T) carries OnDeleteTarget
+						dont_fragment_drain(pair_record, pair_id, CHECK_FLAG(pair_record.flags, HAS_DELETE_FLAG))
+					end
+				end
+			end
 		end
 		if relation_record then
 			local column_index = relation_record.column_index
@@ -3901,9 +4601,24 @@ local function world_new()
 					archetype_destroy(archetype)
 				end
 			end
+
+			-- DontFragment relation: every (R, T) record holds its own sparse set
+			if relation_record.sparse then
+				local delete_holders = CHECK_FLAG(relation_record.flags, HAS_DELETE_FLAG)
+				local sparse_pairs: { u53 } = {}
+				for pair_id in relation_record.first_records do
+					table.insert(sparse_pairs, pair_id)
+				end
+				for _, pair_id in sparse_pairs do
+					local pair_record = components_lookup[pair_id] :: PairRecord
+					if pair_record and pair_record.sparse then
+						dont_fragment_drain(pair_record, pair_id, delete_holders)
+					end
+				end
+			end
 		end
 
-		if record.archetype ~= ROOT_ARCHETYPE then
+		if record.archetype ~= ROOT_ARCHETYPE or record.sparse_count > 0 then
 			clear_entity_components(entity, record)
 		end
 		local modified_archetype = record.archetype
@@ -3914,7 +4629,7 @@ local function world_new()
 			record.archetype = ROOT_ARCHETYPE
 			record.archetype_row = -1
 			if record.targets > 0 then
-				hierarchy_moved(record, ROOT_ARCHETYPE)
+				hierarchy_moved(record)
 			end
 		end
 		record.deleting = false
@@ -3935,6 +4650,27 @@ local function world_new()
 		if not component_record then
 			return
 		end
+
+		local sparse = (component_record :: PairRecord).sparse
+		if sparse then
+			if PAIR_SECOND(id) == ECS_WILDCARD then
+				-- (R, *): every pair of the relation
+				local pair_ids: { u53 } = {}
+				for pair_id in (component_record :: PairRecord).first_records do
+					table.insert(pair_ids, pair_id)
+				end
+				for _, pair_id in pair_ids do
+					local pair_record = components_lookup[pair_id] :: PairRecord
+					if pair_record and pair_record.sparse then
+						dont_fragment_drain(pair_record, pair_id, false)
+					end
+				end
+			else
+				dont_fragment_drain(component_record :: PairRecord, id, false)
+			end
+			return
+		end
+
 		component_record_wipe(component_record, id)
 	end
 
@@ -3945,7 +4681,7 @@ local function world_new()
 		end
 
 		local archetype = record.archetype
-		if archetype == ROOT_ARCHETYPE then
+		if archetype == ROOT_ARCHETYPE and record.sparse_count == 0 then
 			return
 		end
 
@@ -4015,9 +4751,69 @@ local function world_new()
 		end
 	end
 
+	-- Partitions a bulk id list into fragmenting ids and DontFragment pairs
+	-- (with their values when given). Returns the input tables untouched when
+	-- there is nothing to split. `ensure` creates the (R, *) records, which an
+	-- add/set would create anyway; a remove only consults existing ones.
+	local function split_dont_fragment(
+		ids: { u53 },
+		values: { any }?,
+		ensure: boolean
+	): ({ u53 }, { any }?, { u53 }?, { any }?)
+		local fragmenting, fragmenting_values = ids, values
+		local sparse_ids: { u53 }? = nil
+		local sparse_values: { any }? = nil
+
+		for index, id in ids do
+			local is_sparse = false
+			if IS_PAIR(id) then
+				local relation_wildcard = ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)
+				local relation_record = if ensure
+					then wildcard_record_ensure(relation_wildcard)
+					else components_lookup[relation_wildcard]
+				is_sparse = relation_record ~= nil and CHECK_FLAG(relation_record.flags, IS_DONT_FRAGMENT_FLAG)
+			end
+
+			if is_sparse then
+				if not sparse_ids then
+					sparse_ids = {}
+					sparse_values = if values then {} else nil
+					fragmenting = table.move(ids, 1, index - 1, 1, {})
+					fragmenting_values = if values then table.move(values, 1, index - 1, 1, {}) else nil
+				end
+				local sparse_list = sparse_ids :: { u53 }
+				local count = #sparse_list + 1
+				sparse_list[count] = id
+				if sparse_values then
+					sparse_values[count] = (values :: { any })[index]
+				end
+			elseif sparse_ids then
+				local count = #fragmenting + 1
+				fragmenting[count] = id
+				if fragmenting_values then
+					fragmenting_values[count] = (values :: { any })[index]
+				end
+			end
+		end
+		return fragmenting, fragmenting_values, sparse_ids, sparse_values
+	end
+
 	local function world_bulk_add(entity: u53, ids: { u53 })
 		local record = get_entity_record_asserts_alive(entity)
 		if not record then
+			return
+		end
+
+		-- DontFragment pairs never enter the archetype: the fragmenting ids
+		-- go through the bulk path, the sparse pairs are added one by one
+		local fragmenting, _, sparse_ids = split_dont_fragment(ids, nil, true)
+		if sparse_ids then
+			if #fragmenting > 0 then
+				world_bulk_add(entity, fragmenting)
+			end
+			for _, id in sparse_ids do
+				dont_fragment_set(entity, record, dont_fragment_relation(id) :: PairRecord, id, false, nil)
+			end
 			return
 		end
 
@@ -4111,6 +4907,18 @@ local function world_new()
 	local function world_bulk_set(entity: u53, ids: { u53 }, values: { any })
 		local record = get_entity_record_asserts_alive(entity)
 		if not record then
+			return
+		end
+
+		local fragmenting, fragmenting_values, sparse_ids, sparse_values = split_dont_fragment(ids, values, true)
+		if sparse_ids then
+			if #fragmenting > 0 then
+				world_bulk_set(entity, fragmenting, fragmenting_values :: { any })
+			end
+			for index, id in sparse_ids do
+				local relation_record = dont_fragment_relation(id) :: PairRecord
+				dont_fragment_set(entity, record, relation_record, id, true, (sparse_values :: { any })[index])
+			end
 			return
 		end
 
@@ -4234,6 +5042,19 @@ local function world_new()
 			return
 		end
 
+		if record.sparse_count > 0 then
+			local fragmenting, _, sparse_ids = split_dont_fragment(ids, nil, false)
+			if sparse_ids then
+				if #fragmenting > 0 then
+					world_bulk_remove(entity, fragmenting)
+				end
+				for _, id in sparse_ids do
+					dont_fragment_remove(entity, record, dont_fragment_relation(id) :: PairRecord, id, true)
+				end
+				return
+			end
+		end
+
 		local source = record.archetype
 		if source == ROOT_ARCHETYPE then
 			return
@@ -4270,7 +5091,7 @@ local function world_new()
 				record.archetype = ROOT_ARCHETYPE
 				record.archetype_row = -1
 				if record.targets > 0 then
-					hierarchy_moved(record, ROOT_ARCHETYPE)
+					hierarchy_moved(record)
 				end
 			else
 				archetype_move_entity(entity, record, source, destination)
@@ -4326,40 +5147,49 @@ local function world_new()
 			return nil, nil
 		end
 		local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
-		local component_record = components_lookup[relation_wildcard]
-		if not component_record then
+		local relation_record = components_lookup[relation_wildcard] :: PairRecord
+		if not relation_record then
 			return nil, nil
 		end
 
-		local archetype: Archetype = record.archetype
-		local index = component_record.column_index[archetype.archetype_id]
-		if not index then
+		local pair_id = first_pair_of(record, relation_record)
+		if not pair_id then
 			return nil, nil
 		end
 
 		-- fast path: the (R, T) node caches the nearest holder of every id
-		local pair_record = components_lookup[archetype.components[index]] :: PairRecord
+		local pair_record = components_lookup[pair_id] :: PairRecord
 		local node = pair_record and pair_record.node
 		if node then
 			local element = hierarchy.reachable(node)[id]
 			if not element then
 				return nil, nil
 			end
-			return element.entity, element.column[element.record.archetype_row]
+			local element_sparse = element.sparse
+			local row = if element_sparse
+				then element_sparse.index[ENTITY_ID(element.entity)]
+				else element.record.archetype_row
+			return element.entity, element.column[row]
 		end
 
 		-- slow path: relations without the Traversable trait walk the chain
+		local is_pair = IS_PAIR(id)
 		for _ = 1, MAX_TRAVERSE_DEPTH do
-			local target_record = get_entity_record(PAIR_SECOND(archetype.components[index])) :: EntityRecord
-			local target_archetype = target_record.archetype
-			local column = target_archetype.columns_map[id]
+			local target_record = get_entity_record(PAIR_SECOND(pair_id :: u53)) :: EntityRecord
+			local target_entity = dense_arr[target_record.dense]
+			local column = target_record.archetype.columns_map[id]
 
 			if column then
-				return dense_arr[target_record.dense], column[target_record.archetype_row]
+				return target_entity, column[target_record.archetype_row]
 			end
-			archetype = target_archetype
-			index = component_record.column_index[archetype.archetype_id]
-			if not index then
+			if is_pair and target_record.sparse_count > 0 then
+				local sparse, slot = dont_fragment_slot(ENTITY_ID(target_entity), id)
+				if sparse then
+					return target_entity, sparse.values[slot :: number]
+				end
+			end
+			pair_id = first_pair_of(target_record, relation_record)
+			if not pair_id then
 				return nil, nil
 			end
 		end
@@ -4408,7 +5238,36 @@ local function world_new()
 		if not record then
 			return 0
 		end
-		return archetype_depth(record.archetype, relation or ECS_CHILDOF)
+		relation = relation or ECS_CHILDOF
+
+		local relation_record = components_lookup[ECS_PAIR(relation :: u53, ECS_WILDCARD)] :: PairRecord
+		if not relation_record or not relation_record.sparse then
+			return archetype_depth(record.archetype, relation :: u53)
+		end
+
+		-- DontFragment relation: the depth is per entity
+		local pair_id = first_pair_of(record, relation_record)
+		if not pair_id then
+			return 0
+		end
+		local node = (components_lookup[pair_id] :: PairRecord).node
+		if node then
+			return hierarchy.depth(node) + 1
+		end
+
+		local depth = 0
+		local visited: Map<EntityRecord, true> = {}
+		local current = record
+		while pair_id do
+			depth += 1
+			current = get_entity_record(PAIR_SECOND(pair_id)) :: EntityRecord
+			if visited[current] then
+				error "relation cycle detected while computing depth"
+			end
+			visited[current] = true
+			pair_id = first_pair_of(current, relation_record)
+		end
+		return depth
 	end
 
 	local function world_target(entity: u53, relation: u53, index: number?): u53?
@@ -4424,12 +5283,20 @@ local function world_new()
 		if not pair_record then
 			return nil
 		end
+		local nth = index or 0
+
+		local relation_sparse = pair_record.sparse
+		if relation_sparse then
+			local slot = relation_sparse.index[ENTITY_ID(entity)]
+			local target_pair = if slot then relation_sparse.values[slot][nth + 1] else nil
+			return if target_pair then get_entity_any(PAIR_SECOND(target_pair)) else nil
+		end
+
 		local pairs_count = pair_record.pairs_count[archetype_id]
 
 		if not pairs_count then
 			return nil
 		end
-		local nth = index or 0
 		if nth >= pairs_count then
 			return nil
 		end
@@ -4449,6 +5316,21 @@ local function world_new()
 		local pair_record = components_lookup[relation_wildcard] :: PairRecord
 		if not pair_record then
 			return NOOP :: () -> u53
+		end
+
+		local relation_sparse = pair_record.sparse
+		if relation_sparse then
+			local slot = relation_sparse.index[ENTITY_ID(entity)]
+			if not slot then
+				return NOOP :: () -> u53
+			end
+			-- read live: the list shrinks when a pair is removed mid iteration
+			local list = relation_sparse.values[slot] :: { u53 }
+			local position = 0
+			return function(): u53
+				position += 1
+				return list[position]
+			end
 		end
 
 		local archetype = record.archetype
@@ -4475,10 +5357,28 @@ local function world_new()
 		end
 	end
 
+	-- iterates the holders of a DontFragment sparse set backwards, so deleting
+	-- the yielded entity (a swap-remove) is safe
+	local function each_sparse(dense: { u53 }): () -> u53
+		local row = #dense + 1
+		return function(): u53
+			row -= 1
+			if row > #dense then
+				row = #dense
+			end
+			return dense[row]
+		end
+	end
+
 	local function world_each(id: u53): () -> u53
 		local component_record = components_lookup[id]
 		if not component_record then
 			return NOOP :: () -> u53
+		end
+
+		local sparse = (component_record :: PairRecord).sparse
+		if sparse then
+			return each_sparse(sparse.dense)
 		end
 
 		-- Walk archetype_ids backwards by index: if the caller destroys the
@@ -4490,8 +5390,36 @@ local function world_new()
 		local archetype: Archetype? = nil
 		local row = 0
 
+		-- (*, T): DontFragment pairs targeting T have no archetype, their
+		-- sparse sets are walked after the archetypes
+		local sparse_sets: { SparseSet }? = nil
+		if IS_PAIR(id) and PAIR_FIRST(id) == ECS_WILDCARD then
+			for _, pair_record in (component_record :: PairRecord).second_records do
+				local pair_sparse = pair_record.sparse
+				if pair_sparse and #pair_sparse.dense > 0 then
+					sparse_sets = sparse_sets or {}
+					table.insert(sparse_sets :: { SparseSet }, pair_sparse)
+				end
+			end
+		end
+		local sparse_iter: (() -> u53)? = nil
+
 		return function(): u53
 			while true do
+				if sparse_iter then
+					local entity = sparse_iter()
+					if entity then
+						return entity
+					end
+					local sets = sparse_sets :: { SparseSet }
+					local next_set = table.remove(sets)
+					if not next_set then
+						return nil :: any
+					end
+					sparse_iter = each_sparse(next_set.dense)
+					continue
+				end
+
 				if archetype and not archetype.destroyed then
 					-- re-read: a bulk move replaces archetype.entities
 					local entities = archetype.entities
@@ -4508,6 +5436,13 @@ local function world_new()
 				index -= 1
 				local archetype_id = archetype_ids[index]
 				if not archetype_id then
+					if sparse_sets then
+						local sets = sparse_sets :: { SparseSet }
+						local next_set = table.remove(sets) :: SparseSet
+						sparse_iter = each_sparse(next_set.dense)
+						archetype = nil
+						continue
+					end
 					return nil :: any
 				end
 				archetype = archetypes[archetype_id]
@@ -4640,6 +5575,8 @@ local function world_new()
 		monitor_new = monitor_new,
 		hierarchy = hierarchy,
 		archetype_depth = archetype_depth,
+		dont_fragment_records = dont_fragment_records,
+		first_pair_of = first_pair_of,
 		get_archetypes_count = function()
 			return archetypes_count
 		end,
@@ -4651,6 +5588,7 @@ local function world_new()
 		ECS_WILDCARD = ECS_WILDCARD,
 		ECS_TRANSITIVE = ECS_TRANSITIVE,
 		ECS_TRAVERSABLE = ECS_TRAVERSABLE,
+		ECS_DONT_FRAGMENT = ECS_DONT_FRAGMENT,
 		NULL_ARRAY = NULL_ARRAY,
 	}
 
@@ -4802,6 +5740,7 @@ local function world_new()
 	world_set(ECS_NAME, ECS_NAME, "ecs.Name")
 	world_set(ECS_REST, ECS_NAME, "ecs.Rest")
 	world_set(ECS_TRANSITIVE, ECS_NAME, "ecs.Transitive")
+	world_set(ECS_DONT_FRAGMENT, ECS_NAME, "ecs.DontFragment")
 
 	world_add(ECS_CHILDOF, ECS_EXCLUSIVE)
 	world_add(ECS_CHILDOF, ECS_TRAVERSABLE)
@@ -4852,6 +5791,7 @@ return {
 	Error = ANY(ECS_ERROR) :: Entity,
 	Traversable = ANY(ECS_TRAVERSABLE) :: Entity,
 	Transitive = ANY(ECS_TRANSITIVE) :: Entity,
+	DontFragment = ANY(ECS_DONT_FRAGMENT) :: Entity,
 	Disabled = ANY(ECS_DISABLED) :: Entity,
 
 	world = world_new,

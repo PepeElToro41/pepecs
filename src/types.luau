@@ -135,8 +135,25 @@ export type EntityRecord = {
 	-- number of hierarchy nodes (R, this) targeting the entity. Non zero means
 	-- an archetype move has to re-hydrate those nodes.
 	targets: number,
+	-- number of DontFragment pairs the entity holds (sparse storage). Zero
+	-- lets every op skip the sparse paths.
+	sparse_count: number,
 
 	archetype_changed: { ArchetypeChangedHook }?,
+}
+
+-------------------------------------------------------------------------------
+-- sparse storage (DontFragment)
+-------------------------------------------------------------------------------
+
+-- Storage of a DontFragment pair record. `dense` lists the holders, `index`
+-- maps an entity id to its slot and `values` is aligned with `dense`
+-- (NULL_ARRAY for tags). On a (R, *) record the values are the per entity
+-- lists of (R, T) pair ids, sorted by pair id.
+export type SparseSet = {
+	dense: { u53 },
+	index: Map<u24, number>,
+	values: Column,
 }
 
 -------------------------------------------------------------------------------
@@ -145,10 +162,13 @@ export type EntityRecord = {
 
 -- The nearest holder of an id up a traversable relation. `record` is read
 -- live for the row: a swap-remove changes rows without an archetype move.
+-- `sparse` is set when the id is a DontFragment pair: the row is then the
+-- holder's slot in that set, also read live.
 export type ReachableElement = {
 	entity: u53,
 	record: EntityRecord,
 	column: Column,
+	sparse: SparseSet?,
 }
 
 export type ReachableCache = {
@@ -190,8 +210,9 @@ export type Hierarchy = {
 
 	node_create: (record: PairRecord, relation_record: PairRecord, id: u53) -> HierarchyNode,
 	node_release: (record: PairRecord) -> (),
-	-- re-hydrates every node targeting the entity after it changed archetype
-	moved: (record: EntityRecord, destination: Archetype) -> (),
+	-- re-hydrates every node targeting the entity after its ids changed
+	-- (archetype move or DontFragment pair change); reads record.archetype
+	moved: (record: EntityRecord) -> (),
 	invalidate: (node: HierarchyNode) -> (),
 	depth: (node: HierarchyNode) -> number,
 	reachable: (node: HierarchyNode) -> Map<u53, ReachableElement>,
@@ -212,6 +233,8 @@ export type PairRecord = ComponentRecord & {
 
 	-- set on (R, T) records whose relation is traversable
 	node: HierarchyNode?,
+	-- set on every record of a DontFragment relation
+	sparse: SparseSet?,
 }
 
 export type ComponentRecord = {
@@ -318,6 +341,12 @@ export type WorldInternal = {
 	-- depth of every entity in the archetype through `relation`, 0 without a pair
 	archetype_depth: (archetype: Archetype, relation: u53) -> number,
 
+	-- (R, *) records of every DontFragment relation in use
+	dont_fragment_records: Map<u53, PairRecord>,
+	-- first (R, T) pair of the entity through the (R, *) record, from the
+	-- archetype or the sparse storage. nil without a pair.
+	first_pair_of: (record: EntityRecord, relation_record: PairRecord) -> u53?,
+
 	get_archetypes_count: () -> number,
 
 	ECS_PAIR: (first: u53, second: u53) -> u53,
@@ -327,6 +356,7 @@ export type WorldInternal = {
 	ECS_WILDCARD: u53,
 	ECS_TRANSITIVE: u53,
 	ECS_TRAVERSABLE: u53,
+	ECS_DONT_FRAGMENT: u53,
 	NULL_ARRAY: { any },
 }
 

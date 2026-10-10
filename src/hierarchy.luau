@@ -34,6 +34,8 @@ type Hierarchy = types.Hierarchy
 export type Dependencies = {
 	entity_index: EntityIndex,
 	components_lookup: Map<u53, types.ComponentRecord>,
+	-- (R, *) records of every DontFragment relation, see rebuild_reachable
+	dont_fragment_records: Map<u53, PairRecord>,
 	ECS_PAIR: (first: u24, second: u24) -> u53,
 	PAIR_SECOND: (id: u53) -> u24,
 	ECS_WILDCARD: u53,
@@ -43,6 +45,7 @@ local function new(deps: Dependencies): Hierarchy
 	local sparse = deps.entity_index.sparse
 	local dense = deps.entity_index.dense
 	local components_lookup = deps.components_lookup
+	local dont_fragment_records = deps.dont_fragment_records
 	local ECS_PAIR = deps.ECS_PAIR
 	local ECS_WILDCARD = deps.ECS_WILDCARD
 
@@ -59,13 +62,26 @@ local function new(deps: Dependencies): Hierarchy
 		return epoch
 	end
 
-	-- node of T's first R target as seen from `archetype`, nil at a root
-	local function parent_of(node: Node, archetype: Archetype): Node?
-		local index = node.relation_record.column_index[archetype.archetype_id]
-		if not index then
+	-- node of T's first R target, nil at a root. The first pair comes from T's
+	-- archetype, or from the (R, *) sparse storage when R is DontFragment.
+	local function parent_of(node: Node, record: EntityRecord): Node?
+		local relation_record = node.relation_record
+		local pair_id: u53?
+
+		local relation_sparse = relation_record.sparse
+		if relation_sparse then
+			local slot = relation_sparse.index[node.target]
+			pair_id = if slot then relation_sparse.values[slot][1] else nil
+		else
+			local archetype = record.archetype
+			local index = relation_record.column_index[archetype.archetype_id]
+			pair_id = if index then archetype.components[index] else nil
+		end
+
+		if not pair_id then
 			return nil
 		end
-		local parent_record = components_lookup[archetype.components[index]] :: PairRecord
+		local parent_record = components_lookup[pair_id] :: PairRecord
 		return if parent_record then parent_record.node else nil
 	end
 
@@ -168,7 +184,7 @@ local function new(deps: Dependencies): Hierarchy
 		local target_record = sparse[target]
 		if target_record then
 			target_record.targets += 1
-			local parent = parent_of(node, target_record.archetype)
+			local parent = parent_of(node, target_record)
 			if parent then
 				link(parent, node)
 			end
@@ -206,10 +222,12 @@ local function new(deps: Dependencies): Hierarchy
 		end
 	end
 
-	-- The entity is a target of at least one traversable relation and just
-	-- changed archetype: its own ids changed (reachable) and possibly its
-	-- parent (depth), so every node targeting it is relinked and invalidated.
-	local function moved(record: EntityRecord, destination: Archetype)
+	-- The entity is a target of at least one traversable relation and its ids
+	-- just changed (archetype move, or a DontFragment pair added or removed):
+	-- its own ids changed (reachable) and possibly its parent (depth), so
+	-- every node targeting it is relinked and invalidated. Reads the record's
+	-- current archetype, so callers update it first.
+	local function moved(record: EntityRecord)
 		local entity = dense[record.dense]
 		local target_record = components_lookup[ECS_PAIR(ECS_WILDCARD, entity)] :: PairRecord
 		if not target_record then
@@ -222,7 +240,7 @@ local function new(deps: Dependencies): Hierarchy
 				continue
 			end
 
-			local parent = parent_of(node, destination)
+			local parent = parent_of(node, record)
 			local old_parent = node.parent
 			if parent ~= old_parent then
 				if old_parent then
@@ -285,7 +303,35 @@ local function new(deps: Dependencies): Hierarchy
 		if target_record then
 			local entity = dense[target_record.dense]
 			for id, column in target_record.archetype.columns_map do
-				map[id] = { entity = entity, record = target_record, column = column }
+				map[id] = { entity = entity, record = target_record, column = column, sparse = nil }
+			end
+
+			-- DontFragment pairs are not in the archetype: index them from the
+			-- sparse storage. Like columns_map, the (R, *) id maps to the first
+			-- pair of R.
+			if target_record.sparse_count > 0 then
+				local target = node.target
+				for wildcard_id, relation_record in dont_fragment_records do
+					local relation_sparse = relation_record.sparse :: types.SparseSet
+					local slot = relation_sparse.index[target]
+					if not slot then
+						continue
+					end
+					for position, pair_id in relation_sparse.values[slot] :: { u53 } do
+						local pair_record = components_lookup[pair_id] :: PairRecord
+						local pair_sparse = pair_record.sparse :: types.SparseSet
+						local element: ReachableElement = {
+							entity = entity,
+							record = target_record,
+							column = pair_sparse.values,
+							sparse = pair_sparse,
+						}
+						map[pair_id] = element
+						if position == 1 then
+							map[wildcard_id] = element
+						end
+					end
+				end
 			end
 		end
 

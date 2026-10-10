@@ -4744,6 +4744,684 @@ TEST("query engine monitor", function()
 	end)
 end)
 
+TEST("DontFragment relations", function()
+	local function entities_of(query: any): { any }
+		local out = {}
+		for entity in query do
+			table.insert(out, entity)
+		end
+		return out
+	end
+
+	local function rows(query: any): { any }
+		local out = {}
+		for entity, a, b in query do
+			table.insert(out, { entity, a, b })
+		end
+		return out
+	end
+
+	local function record_of(world: ecs.World, entity: any)
+		return world.internal.entity_index.sparse[(entity :: any) % 2 ^ 24]
+	end
+
+	local function node_of(world: ecs.World, relation: any, target: any)
+		local record = world.components_lookup[ecs.pair(relation, target)] :: any
+		return record and record.node
+	end
+
+	-- a DontFragment relation with a value, a tag one, and a few targets
+	local function setup()
+		local world = ecs.world()
+		local Rel = world.component()
+		world.add(Rel, ecs.DontFragment)
+		local TagRel = world.tag()
+		world.add(TagRel, ecs.DontFragment)
+		local Tag = world.tag()
+		local Model = world.component()
+		return world, Rel, TagRel, Tag, Model, world.entity(), world.entity()
+	end
+
+	CASE("add / set / get / has / remove never create archetypes", function()
+		local world, Rel, TagRel, Tag, Model, t1, t2 = setup()
+		local e = world.entity()
+		world.add(e, Tag)
+		local archetypes = count_keys(world.archetypes)
+
+		world.set(e, ecs.pair(Rel, t1), "one")
+		world.set(e, ecs.pair(Rel, t2), "two")
+		world.add(e, ecs.pair(TagRel, t1))
+		expect(count_keys(world.archetypes)).to.equal(archetypes)
+		expect(record_of(world, e).sparse_count).to.equal(3)
+
+		expect(world.has(e, ecs.pair(Rel, t1))).to.equal(true)
+		expect(world.has(e, ecs.pair(Rel, ecs.Wildcard))).to.equal(true)
+		expect(world.has(e, ecs.pair(ecs.Wildcard, t1))).to.equal(true)
+		expect(world.has(e, ecs.pair(TagRel, t2))).to.equal(false)
+		expect(world.get(e, ecs.pair(Rel, t1))).to.equal "one"
+		expect(world.get(e, ecs.pair(Rel, ecs.Wildcard))).to.equal "one"
+		expect(world.get(e, ecs.pair(TagRel, t1))).to.beNil()
+		local tag, two, model, one = world.get(e, Tag, ecs.pair(Rel, t2), Model, ecs.pair(Rel, t1))
+		expect(tag).to.beNil()
+		expect(two).to.equal "two"
+		expect(model).to.beNil()
+		expect(one).to.equal "one"
+
+		-- set on a held pair updates it in place
+		world.set(e, ecs.pair(Rel, t1), "uno")
+		expect(world.get(e, ecs.pair(Rel, t1))).to.equal "uno"
+		expect(record_of(world, e).sparse_count).to.equal(3)
+
+		expect(function()
+			world.set(e, ecs.pair(TagRel, t2), 1)
+		end).to.throw "tag"
+
+		world.remove(e, ecs.pair(Rel, t1))
+		expect(world.has(e, ecs.pair(Rel, t1))).to.equal(false)
+		expect(world.get(e, ecs.pair(Rel, t2))).to.equal "two"
+		-- removing a missing pair is a no-op
+		world.remove(e, ecs.pair(Rel, t1))
+		expect(record_of(world, e).sparse_count).to.equal(2)
+
+		-- an entity in the root archetype can still hold pairs
+		local root_only = world.entity()
+		world.set(root_only, ecs.pair(Rel, t1), "root")
+		expect(world.get(root_only, ecs.pair(Rel, t1))).to.equal "root"
+		expect(world.has(root_only, ecs.pair(Rel, t1))).to.equal(true)
+		expect(world.get(root_only, Model)).to.beNil()
+	end)
+
+	CASE("target, pairs and each follow pair id order", function()
+		local world, Rel, TagRel, Tag = setup()
+		local t1, t2, t3 = world.entity(), world.entity(), world.entity()
+		local e = world.entity()
+		world.add(e, ecs.pair(Rel, t3))
+		world.add(e, ecs.pair(Rel, t1))
+		world.add(e, ecs.pair(Rel, t2))
+
+		expect(world.target(e, Rel)).to.equal(t1)
+		expect(world.target(e, Rel, 1)).to.equal(t2)
+		expect(world.target(e, Rel, 2)).to.equal(t3)
+		expect(world.target(e, Rel, 3)).to.beNil()
+		expect(world.target(e, TagRel)).to.beNil()
+		expect(collect(world.pairs(e, Rel))).to.equal {
+			ecs.pair(Rel, t1),
+			ecs.pair(Rel, t2),
+			ecs.pair(Rel, t3),
+		}
+
+		local other = world.entity()
+		world.add(other, Tag)
+		world.add(other, ecs.pair(Rel, t1))
+		expect(sorted(collect(world.each(ecs.pair(Rel, t1))))).to.equal(sorted { e, other })
+		expect(sorted(collect(world.each(ecs.pair(Rel, ecs.Wildcard))))).to.equal(sorted { e, other })
+		expect(collect(world.each(ecs.pair(Rel, t3)))).to.equal { e }
+		-- (*, T) walks the sparse sets of every relation targeting T
+		world.add(other, ecs.pair(TagRel, t1))
+		expect(#collect(world.each(ecs.pair(ecs.Wildcard, t1)))).to.equal(3)
+
+		-- deleting the yielded entity mid iteration is safe
+		local seen = 0
+		for entity in world.each(ecs.pair(Rel, t1)) do
+			seen += 1
+			world.delete(entity)
+		end
+		expect(seen).to.equal(2)
+		expect(collect(world.each(ecs.pair(Rel, t1)))).to.equal {}
+	end)
+
+	CASE("exclusive relations swap the held pair", function()
+		local world, Rel = setup()
+		local Ex = world.component()
+		world.add(Ex, ecs.DontFragment)
+		world.add(Ex, ecs.Exclusive)
+		local t1, t2 = world.entity(), world.entity()
+		local e = world.entity()
+
+		local log = {}
+		world.added(ecs.pair(Ex, ecs.Wildcard), function(_, id)
+			table.insert(log, { "added", id })
+		end)
+		world.removed(ecs.pair(Ex, ecs.Wildcard), function(_, id)
+			table.insert(log, { "removed", id })
+			return function()
+				table.insert(log, { "post", id })
+			end
+		end)
+
+		world.set(e, ecs.pair(Ex, t1), 1)
+		world.set(e, ecs.pair(Ex, t2), 2)
+		expect(world.has(e, ecs.pair(Ex, t1))).to.equal(false)
+		expect(world.get(e, ecs.pair(Ex, t2))).to.equal(2)
+		expect(collect(world.pairs(e, Ex))).to.equal { ecs.pair(Ex, t2) }
+		expect(record_of(world, e).sparse_count).to.equal(1)
+		expect(log).to.equal {
+			{ "added", ecs.pair(Ex, t1) },
+			{ "removed", ecs.pair(Ex, t1) },
+			{ "added", ecs.pair(Ex, t2) },
+			{ "post", ecs.pair(Ex, t1) },
+		}
+
+		-- a non exclusive relation keeps both
+		world.add(e, ecs.pair(Rel, t1))
+		world.add(e, ecs.pair(Rel, t2))
+		expect(#collect(world.pairs(e, Rel))).to.equal(2)
+	end)
+
+	CASE("hooks fire for the pair and both wildcards", function()
+		local world, Rel, _, _, _, t1 = setup()
+		local e = world.entity()
+		local log = {}
+		local function hook(name: string)
+			return function(entity, id, value)
+				table.insert(log, { name, id, value })
+			end
+		end
+		world.added(ecs.pair(Rel, t1), hook "added pair")
+		world.added(ecs.pair(Rel, ecs.Wildcard), hook "added rel")
+		world.added(ecs.pair(ecs.Wildcard, t1), hook "added tgt")
+		world.changed(ecs.pair(Rel, ecs.Wildcard), hook "changed rel")
+		world.removed(ecs.pair(ecs.Wildcard, t1), hook "removed tgt")
+
+		world.set(e, ecs.pair(Rel, t1), 1)
+		world.set(e, ecs.pair(Rel, t1), 2)
+		world.remove(e, ecs.pair(Rel, t1))
+
+		local names = {}
+		for _, entry in log do
+			table.insert(names, entry[1])
+		end
+		expect(sorted(names)).to.equal(sorted {
+			"added pair",
+			"added rel",
+			"added tgt",
+			"changed rel",
+			"removed tgt",
+		})
+		expect(log[4]).to.equal { "changed rel", ecs.pair(Rel, t1), 2 }
+	end)
+
+	CASE("clear, wipe and bulk operations", function()
+		local world, Rel, TagRel, Tag, Model, t1, t2 = setup()
+		local e = world.entity()
+
+		world.bulk_set(e, { Model, ecs.pair(Rel, t1), Tag, ecs.pair(Rel, t2) }, { "m", "one", nil, "two" })
+		expect(world.get(e, Model)).to.equal "m"
+		expect(world.has(e, Tag)).to.equal(true)
+		expect(world.get(e, ecs.pair(Rel, t1))).to.equal "one"
+		expect(world.get(e, ecs.pair(Rel, t2))).to.equal "two"
+		expect(#world.internal.get_entity_record(e).archetype.components).to.equal(2)
+
+		world.bulk_add(e, { ecs.pair(TagRel, t1), ecs.pair(TagRel, t2) })
+		expect(record_of(world, e).sparse_count).to.equal(4)
+
+		world.bulk_remove(e, { Tag, ecs.pair(Rel, t1), ecs.pair(TagRel, t2) })
+		expect(world.has(e, Tag)).to.equal(false)
+		expect(world.has(e, ecs.pair(Rel, t1))).to.equal(false)
+		expect(world.has(e, ecs.pair(TagRel, t2))).to.equal(false)
+		expect(record_of(world, e).sparse_count).to.equal(2)
+
+		-- bulk with only sparse pairs from the root archetype
+		local root = world.entity()
+		world.bulk_add(root, { ecs.pair(TagRel, t1) })
+		expect(world.internal.get_entity_record(root).archetype).to.equal(world.ROOT_ARCHETYPE)
+		expect(world.has(root, ecs.pair(TagRel, t1))).to.equal(true)
+
+		-- exclusive swap inside a batch
+		local Ex = world.tag()
+		world.add(Ex, ecs.DontFragment)
+		world.add(Ex, ecs.Exclusive)
+		world.add(root, ecs.pair(Ex, t1))
+		world.bulk_add(root, { Tag, ecs.pair(Ex, t2) })
+		expect(collect(world.pairs(root, Ex))).to.equal { ecs.pair(Ex, t2) }
+		expect(world.has(root, Tag)).to.equal(true)
+
+		-- clear removes archetype ids and sparse pairs, with removed hooks
+		local removed = {}
+		world.removed(ecs.pair(Rel, ecs.Wildcard), function(_, id)
+			table.insert(removed, id)
+		end)
+		world.clear(e)
+		expect(removed).to.equal { ecs.pair(Rel, t2) }
+		expect(record_of(world, e).sparse_count).to.equal(0)
+		expect(world.has(e, Model)).to.equal(false)
+		expect(world.has(e, ecs.pair(TagRel, t1))).to.equal(false)
+
+		-- clear of an entity holding only sparse pairs
+		world.set(e, ecs.pair(Rel, t1), "again")
+		world.clear(e)
+		expect(world.has(e, ecs.pair(Rel, t1))).to.equal(false)
+
+		-- wipe of a pair and of the whole relation
+		local a, b = world.entity(), world.entity()
+		world.add(a, ecs.pair(TagRel, t1))
+		world.add(b, ecs.pair(TagRel, t1))
+		world.add(b, ecs.pair(TagRel, t2))
+		world.wipe(ecs.pair(TagRel, t1))
+		expect(world.has(a, ecs.pair(TagRel, t1))).to.equal(false)
+		expect(world.has(b, ecs.pair(TagRel, t2))).to.equal(true)
+		world.wipe(ecs.pair(TagRel, ecs.Wildcard))
+		expect(world.has(b, ecs.pair(TagRel, t2))).to.equal(false)
+		expect(record_of(world, b).sparse_count).to.equal(0)
+	end)
+
+	CASE("deleting a target or the relation cleans every holder", function()
+		local world, Rel, TagRel, Tag, Model, t1, t2 = setup()
+		local Cascade = world.tag()
+		world.add(Cascade, ecs.DontFragment)
+		world.add(Cascade, ecs.pair(ecs.OnDeleteTarget, ecs.Delete))
+		local Owned = world.tag()
+		world.add(Owned, ecs.DontFragment)
+		world.add(Owned, ecs.pair(ecs.OnDelete, ecs.Delete))
+
+		local a, b, c = world.entity(), world.entity(), world.entity()
+		world.add(a, ecs.pair(Rel, t1))
+		world.add(b, ecs.pair(Rel, t1))
+		world.add(b, ecs.pair(Rel, t2))
+		world.add(c, ecs.pair(Cascade, t1))
+		world.add(c, Tag)
+
+		-- t1 dies: a and b lose their pair, c is deleted (OnDeleteTarget Delete)
+		local removed = {}
+		world.removed(ecs.pair(Rel, ecs.Wildcard), function(entity, id)
+			table.insert(removed, entity)
+		end)
+		world.delete(t1)
+		expect(sorted(removed)).to.equal(sorted { a, b })
+		expect(world.has(a, ecs.pair(Rel, ecs.Wildcard))).to.equal(false)
+		expect(world.target(b, Rel)).to.equal(t2)
+		expect(world.alive(c)).to.equal(false)
+		expect(world.components_lookup[ecs.pair(Rel, t1)]).to.beNil()
+		expect(record_of(world, a).sparse_count).to.equal(0)
+
+		-- the relation dies: pairs are removed (or holders deleted with OnDelete Delete)
+		local d = world.entity()
+		world.add(d, ecs.pair(Owned, t2))
+		world.add(d, ecs.pair(TagRel, t2))
+		local e = world.entity()
+		world.add(e, ecs.pair(TagRel, t2))
+		world.delete(TagRel)
+		expect(world.alive(e)).to.equal(true)
+		expect(record_of(world, e).sparse_count).to.equal(0)
+		expect(world.components_lookup[ecs.pair(TagRel, ecs.Wildcard)]).to.beNil()
+		expect(world.internal.dont_fragment_records[ecs.pair(TagRel, ecs.Wildcard)]).to.beNil()
+		world.delete(Owned)
+		expect(world.alive(d)).to.equal(false)
+
+		-- deleting a holder releases its slots; a recycled id starts clean
+		local holder = world.entity()
+		world.add(holder, ecs.pair(Rel, t2))
+		world.delete(holder)
+		local recycled = world.entity()
+		expect(ecs.PAIR_SECOND(recycled)).to.equal(ecs.PAIR_SECOND(holder))
+		expect(world.has(recycled, ecs.pair(Rel, t2))).to.equal(false)
+		expect(collect(world.each(ecs.pair(Rel, t2)))).to.equal { b }
+		expect(#world.components_lookup[ecs.pair(Rel, t2)].sparse.dense).to.equal(1)
+	end)
+
+	CASE("cycles through a DontFragment relation are torn down", function()
+		local world = ecs.world()
+		local Link = world.tag()
+		world.add(Link, ecs.DontFragment)
+		world.add(Link, ecs.pair(ecs.OnDeleteTarget, ecs.Delete))
+
+		local a, b = world.entity(), world.entity()
+		world.add(a, ecs.pair(Link, b))
+		world.add(b, ecs.pair(Link, a))
+		world.add(a, ecs.pair(Link, a))
+		world.delete(a)
+		expect(world.alive(a)).to.equal(false)
+		expect(world.alive(b)).to.equal(false)
+		expect(world.components_lookup[ecs.pair(Link, a)]).to.beNil()
+		expect(world.components_lookup[ecs.pair(Link, b)]).to.beNil()
+	end)
+
+	CASE("trait rules: relations only, before the first pair", function()
+		local world = ecs.world()
+		local Plain = world.component()
+		world.add(Plain, ecs.DontFragment)
+		local e = world.entity()
+		expect(function()
+			world.set(e, Plain, 1)
+		end).to.throw "relations"
+
+		local Late = world.tag()
+		world.add(e, ecs.pair(Late, world.entity()))
+		expect(function()
+			world.add(Late, ecs.DontFragment)
+		end).to.throw "before"
+
+		-- adding it again to a relation that already has it is a no-op
+		local Rel = world.tag()
+		world.add(Rel, ecs.DontFragment)
+		world.add(e, ecs.pair(Rel, world.entity()))
+		world.add(Rel, ecs.DontFragment)
+		expect(world.has(Rel, ecs.DontFragment)).to.equal(true)
+	end)
+
+	CASE("hierarchy: traversable DontFragment relations use nodes and caches", function()
+		local world, Rel, _, _, Model, t1 = setup()
+		local Ex = world.tag()
+		world.add(Ex, ecs.DontFragment)
+		world.add(Ex, ecs.Exclusive)
+		world.add(Ex, ecs.Traversable)
+
+		local root, mid, leaf = world.entity(), world.entity(), world.entity()
+		world.set(root, Model, "root")
+		world.add(mid, ecs.pair(Ex, root))
+		world.add(leaf, ecs.pair(Ex, mid))
+
+		local root_node = node_of(world, Ex, root)
+		local mid_node = node_of(world, Ex, mid)
+		expect(root_node).never.to.beNil()
+		expect(mid_node.parent).to.equal(root_node)
+		expect(#root_node.children).to.equal(1)
+		expect(record_of(world, root).targets).to.equal(1)
+
+		expect(world.depth(leaf, Ex)).to.equal(2)
+		expect(world.depth(root, Ex)).to.equal(0)
+		expect(world.traverse(leaf, Ex, Model)).to.equal(root)
+		local _, value = world.traverse(leaf, Ex, Model)
+		expect(value).to.equal "root"
+
+		-- a DontFragment pair held by an ancestor is reachable too, and the
+		-- cache follows changes on the ancestor
+		world.set(root, ecs.pair(Rel, t1), "from root")
+		local holder, held = world.traverse(leaf, Ex, ecs.pair(Rel, t1))
+		expect(holder).to.equal(root)
+		expect(held).to.equal "from root"
+		world.set(mid, ecs.pair(Rel, t1), "from mid")
+		holder, held = world.traverse(leaf, Ex, ecs.pair(Rel, t1))
+		expect(holder).to.equal(mid)
+		expect(held).to.equal "from mid"
+		world.remove(mid, ecs.pair(Rel, t1))
+		world.remove(root, ecs.pair(Rel, t1))
+		expect(world.traverse(leaf, Ex, ecs.pair(Rel, t1))).to.beNil()
+
+		-- re-parenting relinks the nodes and re-computes the depth
+		local other = world.entity()
+		world.add(mid, ecs.pair(Ex, other))
+		expect(mid_node.parent).to.equal(node_of(world, Ex, other))
+		expect(#root_node.children).to.equal(0)
+		expect(world.depth(leaf, Ex)).to.equal(2)
+		expect(world.traverse(leaf, Ex, Model)).to.beNil()
+
+		-- removing the pair re-roots mid
+		world.remove(mid, ecs.pair(Ex, other))
+		expect(mid_node.parent).to.beNil()
+		expect(world.depth(leaf, Ex)).to.equal(1)
+
+		-- the non traversable slow path works per entity as well
+		local Plain = world.tag()
+		world.add(Plain, ecs.DontFragment)
+		world.add(mid, ecs.pair(Plain, root))
+		world.add(leaf, ecs.pair(Plain, mid))
+		expect(node_of(world, Plain, root)).to.beNil()
+		expect(world.depth(leaf, Plain)).to.equal(2)
+		expect(world.traverse(leaf, Plain, Model)).to.equal(root)
+		world.add(root, ecs.pair(Plain, leaf))
+		expect(function()
+			world.depth(leaf, Plain)
+		end).to.throw "cycle"
+	end)
+
+	CASE("engine: terms are checked per entity, archetypes still drive", function()
+		local world, Rel, TagRel, Tag, Model, t1, t2 = setup()
+		local e1, e2, e3 = world.entity(), world.entity(), world.entity()
+		world.add(e1, Tag)
+		world.set(e1, ecs.pair(Rel, t1), "e1")
+		world.add(e2, Tag)
+		world.set(e2, ecs.pair(Rel, t1), "e2")
+		world.set(e2, ecs.pair(Rel, t2), "e2-t2")
+		world.add(e3, Tag)
+		world.add(e3, ecs.pair(TagRel, t1))
+
+		local query = world.query_build():with(Tag):term(ecs.pair(Rel, t1)):build()
+		local results = rows(query)
+		expect(#results).to.equal(2)
+		for _, row in results do
+			expect(row[2]).to.equal(if row[1] == e1 then "e1" else "e2")
+		end
+		-- the archetype of Tag holders is the only prematched one
+		expect(#query:archetypes()).to.equal(1)
+		expect(query:cached()).to.equal(query)
+		expect(#rows(query)).to.equal(2)
+		query:cleanup()
+
+		expect(entities_of(world.query_build():with(Tag):without(ecs.pair(Rel, t1)):build())).to.equal { e3 }
+		expect(entities_of(world.query_build():with(Tag):with(ecs.pair(TagRel, t1)):build())).to.equal { e3 }
+
+		local optional = rows(world.query_build():with(Tag):term(ecs.pair(Rel, t2)):optional():build())
+		expect(#optional).to.equal(3)
+		for _, row in optional do
+			expect(row[2]).to.equal(if row[1] == e2 then "e2-t2" else nil)
+		end
+
+		-- bor between a sparse and a fragmenting term
+		world.set(e3, Model, "m3")
+		local bor = rows(world.query_build():with(Tag):term(ecs.pair(Rel, t1)):bor():term(Model):build())
+		expect(#bor).to.equal(3)
+		for _, row in bor do
+			expect(row[2]).to.equal(if row[1] == e3 then "m3" elseif row[1] == e1 then "e1" else "e2")
+		end
+
+		-- wildcard and concrete :target()
+		expect(#rows(world.query_build():with(Tag):term(Rel):wildcard():build())).to.equal(2)
+		expect(entities_of(world.query_build():with(Tag):with(Rel):target(t2):build())).to.equal { e2 }
+		expect(sorted(entities_of(world.query_build():with(Tag):without(Rel):wildcard():build()))).to.equal(
+			sorted { e3 }
+		)
+	end)
+
+	CASE("engine: variables bind through sparse pairs", function()
+		local world, Rel, _, Tag, Model, t1, t2 = setup()
+		world.set(t1, Model, "model1")
+		local e1, e2 = world.entity(), world.entity()
+		world.add(e1, Tag)
+		world.set(e1, ecs.pair(Rel, t1), "e1-t1")
+		world.add(e2, Tag)
+		world.set(e2, ecs.pair(Rel, t1), "e2-t1")
+		world.set(e2, ecs.pair(Rel, t2), "e2-t2")
+
+		-- :target("$t") enumerates the entity's pairs
+		local query = world.query_build():with(Tag):term(Rel):target("$t"):build()
+		local seen = 0
+		for entity, value in query do
+			seen += 1
+			expect(world.get(entity, ecs.pair(Rel, query:var "$t"))).to.equal(value)
+		end
+		expect(seen).to.equal(3)
+
+		-- a term from the bound target
+		local from = rows(world.query_build():with(Tag):term(Rel):target("$t"):term(Model):from("$t"):build())
+		expect(#from).to.equal(2)
+		for _, row in from do
+			expect(row[3]).to.equal "model1"
+		end
+
+		-- unbound source scanning a sparse set, and the reverse lookup
+		local scan = rows(world.query_build():with(Model):term(ecs.pair(Rel, t1)):from("$h"):build())
+		expect(#scan).to.equal(2)
+		expect(scan[1][1]).to.equal(t1)
+		local reverse = world.query_build():with(Model):term(Rel):from("$h"):target("$this"):build()
+		expect(#rows(reverse)).to.equal(2)
+
+		-- a variable bound by a sparse pair checked against a second sparse term
+		local Other = world.tag()
+		world.add(Other, ecs.DontFragment)
+		world.add(e2, ecs.pair(Other, t2))
+		local both = world.query_build():with(Tag):with(Rel):target("$t"):with(Other):target("$t"):build()
+		expect(entities_of(both)).to.equal { e2 }
+	end)
+
+	CASE("engine: queries made of sparse terms iterate the sparse set", function()
+		local world, Rel, _, Tag, Model, t1 = setup()
+		local e1, e2, e3 = world.entity(), world.entity(), world.entity()
+		world.set(e1, ecs.pair(Rel, t1), "e1")
+		world.set(e2, ecs.pair(Rel, t1), "e2")
+		world.add(e2, Tag)
+		world.set(e3, ecs.pair(Rel, world.entity()), "e3")
+
+		local query = world.query_build():term(ecs.pair(Rel, t1)):build()
+		local results = rows(query)
+		expect(#results).to.equal(2)
+		for _, row in results do
+			expect(row[2]).to.equal(if row[1] == e1 then "e1" else "e2")
+		end
+		expect(#entities_of(world.query_build():with(Rel):wildcard():build())).to.equal(3)
+		-- fragmenting terms are checked per entity on top
+		expect(entities_of(world.query_build():term(ecs.pair(Rel, t1)):with(Tag):build())).to.equal { e2 }
+		local mixed = rows(world.query_build():term(ecs.pair(Rel, t1)):term(Model):optional():build())
+		expect(#mixed).to.equal(2)
+
+		-- no archetype list to expose, cached() is a no-op
+		expect(query:cached()).to.equal(query)
+		expect(query.is_cached).to.equal(false)
+		expect(function()
+			query:archetypes()
+		end).to.throw "DontFragment"
+		expect(function()
+			query:match(world.ROOT_ARCHETYPE)
+		end).to.throw "DontFragment"
+
+		-- deleting the yielded entity mid iteration visits everyone once
+		local seen = {}
+		for entity in world.query_build():term(ecs.pair(Rel, t1)):build() do
+			table.insert(seen, entity)
+			world.delete(entity)
+		end
+		expect(sorted(seen)).to.equal(sorted { e1, e2 })
+		expect(entities_of(world.query_build():term(ecs.pair(Rel, t1)):build())).to.equal {}
+	end)
+
+	CASE("engine: up traverses sparse relations and reaches sparse ids", function()
+		local world, Rel, _, Tag, Model, t1 = setup()
+		local Ex = world.tag()
+		world.add(Ex, ecs.DontFragment)
+		world.add(Ex, ecs.Exclusive)
+		world.add(Ex, ecs.Traversable)
+
+		local root, child, grandchild = world.entity(), world.entity(), world.entity()
+		world.set(root, Model, "root")
+		world.add(child, ecs.pair(Ex, root))
+		world.add(child, Tag)
+		world.add(grandchild, ecs.pair(Ex, child))
+		world.add(grandchild, Tag)
+
+		-- :up() through a sparse relation
+		local up = rows(world.query_build():with(Tag):term(Model):up(Ex):build())
+		expect(#up).to.equal(2)
+		for _, row in up do
+			expect(row[2]).to.equal "root"
+		end
+		expect(entities_of(world.query_build():with(Tag):without(Model):up(Ex):build())).to.equal {}
+		-- only sparse terms: the (Ex, *) set drives
+		expect(#rows(world.query_build():term(Model):up(Ex):build())).to.equal(2)
+
+		-- a sparse id looked up on an ancestor through ChildOf uses the
+		-- reachable cache and follows changes on the ancestor
+		local parent, kid = world.entity(), world.entity()
+		world.set(parent, ecs.pair(Rel, t1), "parent")
+		world.add(kid, ecs.pair(ecs.ChildOf, parent))
+		world.add(kid, Tag)
+		local reach = world.query_build():with(Tag):term(ecs.pair(Rel, t1)):up(ecs.ChildOf):build()
+		expect(rows(reach)).to.equal { { kid, "parent" } }
+		world.set(parent, ecs.pair(Rel, t1), "changed")
+		expect(rows(reach)).to.equal { { kid, "changed" } }
+		world.remove(parent, ecs.pair(Rel, t1))
+		expect(rows(reach)).to.equal {}
+		world.set(parent, ecs.pair(Rel, t1), "back")
+		expect(rows(reach)).to.equal { { kid, "back" } }
+
+		-- :self() prefers the entity's own sparse pair, also for wildcards
+		world.set(kid, ecs.pair(Rel, t1), "own")
+		local own = world.query_build():with(Tag):term(ecs.pair(Rel, t1)):up(ecs.ChildOf):self():build()
+		expect(rows(own)).to.equal { { kid, "own" } }
+		local wildcard = world.query_build():with(Tag):term(Rel):wildcard():up(ecs.ChildOf):self():build()
+		expect(rows(wildcard)).to.equal { { kid, "own" } }
+		world.remove(kid, ecs.pair(Rel, t1))
+		expect(rows(own)).to.equal { { kid, "back" } }
+
+		-- transitive through a sparse relation
+		local Located = world.tag()
+		world.add(Located, ecs.DontFragment)
+		world.add(Located, ecs.Exclusive)
+		world.add(Located, ecs.Transitive)
+		local earth, country, city = world.entity(), world.entity(), world.entity()
+		world.add(country, ecs.pair(Located, earth))
+		world.add(city, ecs.pair(Located, country))
+		world.add(city, Tag)
+		world.add(country, Tag)
+		expect(sorted(entities_of(world.query_build():with(Tag):with(Located):target(earth):build()))).to.equal(
+			sorted { country, city }
+		)
+	end)
+
+	CASE("engine: unsupported features error", function()
+		local world, Rel, _, Tag, Model, t1 = setup()
+		local Ex = world.tag()
+		world.add(Ex, ecs.DontFragment)
+		world.add(Ex, ecs.Traversable)
+
+		expect(function()
+			world.query_build():with(Tag):cascade(Ex)
+		end).to.throw "DontFragment"
+		expect(function()
+			world.query_build():with(Tag):term(ecs.pair(Rel, t1)):build():monitor()
+		end).to.throw "DontFragment"
+		expect(function()
+			world.query_build():with(Tag):term(Model):up(Ex):build():monitor()
+		end).to.throw "DontFragment"
+		expect(function()
+			world.query_build():with(Tag):term(Rel):target("$t"):term(Model):from("$t"):build():monitor()
+		end).to.throw "DontFragment"
+	end)
+
+	CASE("world.query falls back to the engine", function()
+		local world, Rel, _, Tag, Model, t1 = setup()
+		-- created before any pair of the relation exists
+		local early = world.query(Tag, ecs.pair(Rel, t1))
+		local e1, e2 = world.entity(), world.entity()
+		world.add(e1, Tag)
+		world.set(e1, ecs.pair(Rel, t1), "v1")
+		world.add(e2, Tag)
+		world.set(e2, Model, "m2")
+
+		expect(rows(early)).to.equal { { e1, nil, "v1" } }
+		expect(early:count()).to.equal(1)
+		expect(early:empty()).to.equal(false)
+		expect(early:has(e1)).to.equal(true)
+		expect(early:has(e2)).to.equal(false)
+		expect(early:entities()).to.equal { e1 }
+		expect(early:random()).to.equal(e1)
+		local first, _, value = early:first()
+		expect(first).to.equal(e1)
+		expect(value).to.equal "v1"
+		expect(early:first(function(entity)
+			return entity ~= e1
+		end)).to.beNil()
+		expect(early:clone():count()).to.equal(1)
+
+		-- :with() / :without() added later swap the query as well
+		expect(entities_of(world.query(Tag):without(ecs.pair(Rel, t1)))).to.equal { e2 }
+		local cached = world.query(Tag):with(ecs.pair(Rel, t1)):cached()
+		expect(cached:count()).to.equal(1)
+		expect(cached.is_cached).to.equal(true)
+		cached:cleanup()
+
+		for _, method in { "columns", "patch", "archetypes", "match", "rematch", "monitor", "observe", "changed" } do
+			expect(function()
+				(early :: any)[method](early)
+			end).to.throw "DontFragment"
+		end
+
+		-- a query without such pairs keeps the archetype path
+		local plain = world.query(Tag)
+		expect(getmetatable(plain :: any)).never.to.equal(getmetatable(early :: any))
+		expect(plain:count()).to.equal(2)
+	end)
+end)
+
 local report = testlib.run(plan)
 testlib.report(report)
 

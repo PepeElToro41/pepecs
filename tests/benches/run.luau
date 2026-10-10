@@ -43,6 +43,7 @@ local TOPICS = {
 	"deletion",
 	"cascade",
 	"pairs",
+	"dont_fragment",
 	"hierarchy",
 	"hooks",
 	"query_iter",
