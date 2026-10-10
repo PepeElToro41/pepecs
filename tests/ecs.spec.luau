@@ -2580,7 +2580,7 @@ TEST("internal: archetype graph", function()
 		expect(a.alive).to.equal(false)
 	end)
 
-	CASE("MATCH_ARCHETYPE and FIND_MATCHED_ARCHETYPES", function()
+	CASE("ARCHETYPE_MATCHER_NEW and FIND_MATCHED_ARCHETYPES", function()
 		local world = ecs.world()
 		local internal = world.internal
 		local A = world.tag()
@@ -2590,18 +2590,137 @@ TEST("internal: archetype graph", function()
 		local a = (internal.get_entity_record(e) :: any).archetype
 		local ab = internal.archetype_ensure { A, B }
 
-		expect(internal.MATCH_ARCHETYPE({ A }, nil, a)).to.equal(true)
-		expect(internal.MATCH_ARCHETYPE({ A, B }, nil, a)).to.equal(false)
-		expect(internal.MATCH_ARCHETYPE({ A }, { B }, ab)).to.equal(false)
-		expect(internal.MATCH_ARCHETYPE({ A }, { B }, a)).to.equal(true)
+		local function matcher(with, without)
+			local m = internal.ARCHETYPE_MATCHER_NEW(with, without)
+			m.match = internal.ARCHETYPE_MATCHER_MATCH(m)
+			return m
+		end
 
-		local all = internal.FIND_MATCHED_ARCHETYPES(world, { A }, nil, false)
+		expect(matcher({ A }, nil).match(a)).to.equal(true)
+		expect(matcher({ A, B }, nil).match(a)).to.equal(false)
+		expect(matcher({ A }, { B }).match(ab)).to.equal(false)
+		expect(matcher({ A }, { B }).match(a)).to.equal(true)
+		-- the closure is built once per matcher
+		local m = internal.ARCHETYPE_MATCHER_NEW({ A }, nil)
+		expect(m.match).to.beNil()
+		expect(internal.ARCHETYPE_MATCHER_MATCH(m)).to.equal(internal.ARCHETYPE_MATCHER_MATCH(m))
+		expect(m.match).to.equal(internal.ARCHETYPE_MATCHER_MATCH(m))
+
+		local all = internal.FIND_MATCHED_ARCHETYPES(world, matcher({ A }, nil), false)
 		expect(#all).to.equal(2)
-		local alive = internal.FIND_MATCHED_ARCHETYPES(world, { A }, nil, true)
+		local alive = internal.FIND_MATCHED_ARCHETYPES(world, matcher({ A }, nil), true)
 		expect(alive).to.equal { a }
-		expect(internal.FIND_MATCHED_ARCHETYPES(world, { A }, { B }, false)).to.equal { a }
-		expect(internal.FIND_MATCHED_ARCHETYPES(world, { world.tag() }, nil, false)).to.equal {}
-		expect(internal.FIND_MATCHED_ARCHETYPES(world, { A, world.tag() }, nil, false)).to.equal {}
+		expect(internal.FIND_MATCHED_ARCHETYPES(world, matcher({ A }, { B }), false)).to.equal { a }
+		expect(internal.FIND_MATCHED_ARCHETYPES(world, matcher({ world.tag() }, nil), false)).to.equal {}
+		expect(internal.FIND_MATCHED_ARCHETYPES(world, matcher({ A, world.tag() }, nil), false)).to.equal {}
+	end)
+
+	CASE("ARCHETYPE_MATCHER_NEW: bitset ids, slow ids and the signature", function()
+		local world = ecs.world()
+		local internal = world.internal
+		local A = world.tag()
+		local B = world.tag()
+		local Rel = world.tag()
+		-- entities used as tags and pairs sit outside the bitset range
+		local T = world.entity()
+		local parent = world.entity()
+		local pair = ecs.pair(Rel, parent)
+		local rel_wc = ecs.pair(Rel, ecs.Wildcard)
+		local wc_parent = ecs.pair(ecs.Wildcard, parent)
+
+		local function matcher(with, without)
+			local m = internal.ARCHETYPE_MATCHER_NEW(with, without)
+			m.match = internal.ARCHETYPE_MATCHER_MATCH(m)
+			return m
+		end
+
+		-- splitting: components go to word masks, the rest to the slow lists
+		local m = matcher({ A, T, pair }, { B, rel_wc })
+		expect(m.with_words).to.equal { 0, bit32.lshift(1, A - 1) }
+		expect(m.with_slow).to.equal { T, pair }
+		expect(m.without_words).to.equal { 0, bit32.lshift(1, B - 1) }
+		expect(m.without_slow).to.equal { rel_wc }
+		expect(#m.without_slow_blooms).to.equal(1)
+		expect(#m.with_ids).to.equal(3)
+		expect(#m.without_ids).to.equal(2)
+		expect(#matcher({ A }, nil).without_ids).to.equal(0)
+		-- ids of one word share a mask
+		expect(matcher({ A, B }, nil).with_words).to.equal {
+			0,
+			bit32.bor(bit32.lshift(1, A - 1), bit32.lshift(1, B - 1)),
+		}
+
+		local a = internal.archetype_ensure { A }
+		local a_t = internal.archetype_ensure { A, T }
+		local a_t_pair = internal.archetype_ensure { A, T, pair }
+		local b = internal.archetype_ensure { B }
+
+		-- signature: bit per id in range, bloom folds the words and hashes the rest
+		expect(buffer.readu32(a.bitset, 0)).to.equal(bit32.lshift(1, A - 1))
+		expect(a.bloom).to.equal(bit32.lshift(1, A - 1))
+		expect(buffer.readu32(a_t.bitset, 0)).to.equal(bit32.lshift(1, A - 1))
+		expect(bit32.band(a_t.bloom, a.bloom)).to.equal(a.bloom)
+		expect(a_t.bloom ~= a.bloom).to.equal(true)
+		expect(world.ROOT_ARCHETYPE.bloom).to.equal(0)
+
+		expect(matcher({ A, T }, nil).match(a)).to.equal(false)
+		expect(matcher({ A, T }, nil).match(a_t)).to.equal(true)
+		expect(matcher({ A, T, pair }, nil).match(a_t)).to.equal(false)
+		expect(matcher({ A, T, pair }, nil).match(a_t_pair)).to.equal(true)
+		-- wildcards of the pair are part of the columns map
+		expect(matcher({ rel_wc }, nil).match(a_t_pair)).to.equal(true)
+		expect(matcher({ wc_parent }, nil).match(a_t_pair)).to.equal(true)
+		expect(matcher({ rel_wc }, nil).match(a_t)).to.equal(false)
+		-- without on slow ids
+		expect(matcher({ A }, { T }).match(a)).to.equal(true)
+		expect(matcher({ A }, { T }).match(a_t)).to.equal(false)
+		expect(matcher({ A }, { rel_wc }).match(a_t)).to.equal(true)
+		expect(matcher({ A }, { rel_wc }).match(a_t_pair)).to.equal(false)
+		-- without on bitset ids, across the root archetype
+		expect(matcher({ A }, { B }).match(b)).to.equal(false)
+		expect(matcher({ A }, nil).match(world.ROOT_ARCHETYPE)).to.equal(false)
+
+		local found = internal.FIND_MATCHED_ARCHETYPES(world, matcher({ A }, { T }), false)
+		expect(found).to.equal { a }
+		found = internal.FIND_MATCHED_ARCHETYPES(world, matcher({ pair }, nil), false)
+		expect(found).to.equal { a_t_pair }
+	end)
+
+	CASE("ARCHETYPE_MATCHER_NEW: every word of the bitset range", function()
+		local world = ecs.world()
+		local internal = world.internal
+		-- components spread over every u32 word of the signature
+		local ids = {}
+		for _ = 1, world.internal.MAX_COMPONENT_ID do
+			table.insert(ids, world.tag())
+		end
+		local first = ids[1]
+		local last = ids[#ids]
+		local mid = ids[33]
+
+		local e = world.entity()
+		world.add(e, first)
+		world.add(e, last)
+		local archetype = (internal.get_entity_record(e) :: any).archetype
+
+		local function matcher(with, without)
+			return internal.ARCHETYPE_MATCHER_MATCH(internal.ARCHETYPE_MATCHER_NEW(with, without))
+		end
+
+		local m = internal.ARCHETYPE_MATCHER_NEW({ first, last }, { mid })
+		expect(#m.with_words).to.equal(4)
+		expect(m.with_slow).to.equal {}
+		local match = internal.ARCHETYPE_MATCHER_MATCH(m)
+		expect(match(archetype)).to.equal(true)
+		expect(matcher({ first, mid }, nil)(archetype)).to.equal(false)
+		expect(matcher({ first }, { last })(archetype)).to.equal(false)
+
+		world.add(e, mid)
+		archetype = (internal.get_entity_record(e) :: any).archetype
+		expect(match(archetype)).to.equal(false)
+		expect(matcher({ first, mid, last }, nil)(archetype)).to.equal(true)
+		expect(world.query(first, mid, last):count()).to.equal(1)
+		expect(world.query(first):without(mid):count()).to.equal(0)
 	end)
 end)
 

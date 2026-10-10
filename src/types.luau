@@ -25,6 +25,27 @@ export type RemovedHook<T = any> = ((entity: Entity, id: Id<T>) -> () -> ()?) | 
 
 export type ArchetypeMatch = (archetype: Archetype) -> boolean
 
+-- Precomputed with/without test against an archetype's signature. Ids inside
+-- the bitset range are checked as word masks, everything else (pairs,
+-- wildcards, entities used as tags) falls back to the columns map.
+export type ArchetypeMatcher = {
+	with_ids: { u53 },
+	without_ids: { u53 },
+	-- archetype.bloom must contain with_bloom
+	with_bloom: number,
+	-- flat (byte offset, mask) pairs into archetype.bitset: every with word
+	-- must contain its mask, no without word may intersect its mask
+	with_words: { number },
+	without_words: { number },
+	-- ids outside the bitset range, checked against archetype.columns_map.
+	-- A without id whose bloom is not in archetype.bloom skips the lookup.
+	with_slow: { u53 },
+	without_slow: { u53 },
+	without_slow_blooms: { number },
+	-- closure form, built by ARCHETYPE_MATCHER_MATCH on first use
+	match: ArchetypeMatch?,
+}
+
 export type ArchetypeObserverCallback = (archetype: Archetype) -> ()
 export type ArchetypeObserver = { match: ArchetypeMatch, callback: ArchetypeObserverCallback }
 
@@ -95,6 +116,8 @@ export type QueryInternal = Query<any> & {
 	terms: { u53 },
 	with_ids: { u53 },
 	without_ids: { u53 }?,
+	-- built on the first match, terms are final from then on
+	matcher: ArchetypeMatcher?,
 	cache_cleanup: (() -> ())?,
 
 	world: World,
@@ -115,6 +138,10 @@ export type Archetype = {
 	components: Array<u53>,
 
 	columns_map: { [u53]: Column },
+	-- signature used by ArchetypeMatcher: one bit per id inside the bitset
+	-- range (u32 words) and a 32 bit bloom over every key of columns_map
+	bitset: buffer,
+	bloom: number,
 	-- (R, *) wildcard id -> the single (R, T) pair this archetype holds, for
 	-- every exclusive relation R. Lets add/set/bulk ops find the pair to swap
 	-- out with one lookup.
@@ -321,21 +348,16 @@ export type WorldInternal = {
 		pair_count: number
 	) -> { u53 },
 	INSERT_COMPONENT_HOOK: <T>(callback: T, hooks: { T }?) -> ({ T }, Cleanup),
-	MATCH_ARCHETYPE: (with_ids: { number }, without_ids: { number }?, archetype: Archetype) -> boolean,
-	FIND_MATCHED_ARCHETYPES: (
-		world: World,
-		with_ids: { number },
-		without_ids: { number }?,
-		ignore_empty: boolean
-	) -> { Archetype },
+	ARCHETYPE_MATCHER_NEW: (with_ids: { u53 }, without_ids: { u53 }?) -> ArchetypeMatcher,
+	ARCHETYPE_MATCHER_MATCH: (matcher: ArchetypeMatcher) -> ArchetypeMatch,
+	FIND_MATCHED_ARCHETYPES: (world: World, matcher: ArchetypeMatcher, ignore_empty: boolean) -> { Archetype },
 	OBSERVE_MATCHED_ARCHETYPES: (
 		world: World,
-		with_ids: { number },
-		without_ids: { number }?
+		matcher: ArchetypeMatcher
 	) -> ({ Archetype }, Map<ArchetypeId, number>, Cleanup),
 	MONITOR_ATTACH: (world: World, ids: { u53 }, monitor: QueryIdMonitor) -> Cleanup,
 	OBSERVER_ATTACH: (world: World, ids: { u53 }, observer: QueryIdObserver) -> Cleanup,
-	monitor_new: (world: World, with_ids: { u53 }, without_ids: { u53 }?) -> Monitor,
+	monitor_new: (world: World, matcher: ArchetypeMatcher) -> Monitor,
 
 	hierarchy: Hierarchy,
 	-- depth of every entity in the archetype through `relation`, 0 without a pair

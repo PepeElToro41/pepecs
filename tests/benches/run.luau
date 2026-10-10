@@ -50,6 +50,13 @@ local TOPICS = {
 	"query_rematch",
 	"query_dead",
 	"reactive",
+	"archetype_match",
+}
+
+-- ecs only topics, nothing comparable on the jecs side
+local ECS_ONLY = {
+	reactive = true,
+	archetype_match = true,
 }
 
 local selected = if #args > 0 then args else TOPICS
@@ -65,7 +72,7 @@ for _, topic in selected do
 	print()
 	print(color.green_highlight(` ===== {topic}: ecs ===== `))
 	run(topic, "ecs")
-	if topic ~= "reactive" then
+	if not ECS_ONLY[topic] then
 		print()
 		print(color.green_highlight(` ===== {topic}: jecs ===== `))
 		run(topic, "jecs")

@@ -73,7 +73,7 @@ type BuilderInternal = {
 type Prematcher = {
 	with_ids: { u53 },
 	without_ids: { u53 },
-	match: (archetype: Archetype) -> boolean,
+	matcher: types.ArchetypeMatcher,
 	find: (ignore_empty: boolean) -> { Archetype },
 }
 
@@ -711,18 +711,15 @@ local function compile(builder: BuilderInternal): QueryInternal
 		error "query needs at least one required term on $this"
 	end
 
-	local MATCH_ARCHETYPE = internal.MATCH_ARCHETYPE
 	local FIND_MATCHED_ARCHETYPES = internal.FIND_MATCHED_ARCHETYPES
-	local prematcher_without: { u53 }? = if #without_ids > 0 then without_ids else nil
+	local matcher = internal.ARCHETYPE_MATCHER_NEW(with_ids, if #without_ids > 0 then without_ids else nil)
 
 	local prematcher: Prematcher = {
 		with_ids = with_ids,
 		without_ids = without_ids,
-		match = function(archetype: Archetype): boolean
-			return MATCH_ARCHETYPE(with_ids, prematcher_without, archetype)
-		end,
+		matcher = matcher,
 		find = function(ignore_empty: boolean): { Archetype }
-			return FIND_MATCHED_ARCHETYPES(world, with_ids, prematcher_without, ignore_empty)
+			return FIND_MATCHED_ARCHETYPES(world, matcher, ignore_empty)
 		end,
 	}
 
@@ -2296,7 +2293,7 @@ local function query_match(query: QueryInternal, archetype: Archetype): boolean
 	if map then
 		return map[archetype.archetype_id] ~= nil
 	end
-	return query.prematcher.match(archetype)
+	return query.world.internal.ARCHETYPE_MATCHER_MATCH(query.prematcher.matcher)(archetype)
 end
 
 -- a sparse driven program never reads the archetype list
@@ -2321,12 +2318,7 @@ local function query_cached(query: QueryInternal): QueryInternal
 	if query.is_cached or query.sparse_driver then
 		return query
 	end
-	local prematcher = query.prematcher
-	local list, map, cleanup = query.world.internal.OBSERVE_MATCHED_ARCHETYPES(
-		query.world,
-		prematcher.with_ids,
-		if #prematcher.without_ids > 0 then prematcher.without_ids else nil
-	)
+	local list, map, cleanup = query.world.internal.OBSERVE_MATCHED_ARCHETYPES(query.world, query.prematcher.matcher)
 	query.is_cached = true
 	query.compatible_archetypes = list
 	query.compatible_archetypes_map = map
@@ -2368,7 +2360,7 @@ local function query_monitor(query: QueryInternal): types.Monitor
 	local without_ids: { u53 }? = if #prematcher.without_ids > 0 then prematcher.without_ids else nil
 
 	if query.is_static then
-		return internal.monitor_new(world, prematcher.with_ids, without_ids)
+		return internal.monitor_new(world, prematcher.matcher)
 	end
 	-- monitors compare archetypes, which DontFragment pairs are not part of
 	if query.has_sparse then
@@ -2384,7 +2376,7 @@ local function query_monitor(query: QueryInternal): types.Monitor
 	local get_entity_record = internal.get_entity_record
 	local hierarchy_collect = internal.hierarchy.collect
 
-	local list, map, observe_cleanup = internal.OBSERVE_MATCHED_ARCHETYPES(world, prematcher.with_ids, without_ids)
+	local list, map, observe_cleanup = internal.OBSERVE_MATCHED_ARCHETYPES(world, prematcher.matcher)
 	local probe: (Archetype) -> boolean = iter_program(query, {}, true) :: any
 
 	local reported: Map<u53, boolean> = {}

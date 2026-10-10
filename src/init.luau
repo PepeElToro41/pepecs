@@ -27,6 +27,7 @@ type SetHook<T = any> = types.SetHook<T>
 type RemovedHook<T = any> = types.RemovedHook<T>
 
 export type ArchetypeMatch = types.ArchetypeMatch
+export type ArchetypeMatcher = types.ArchetypeMatcher
 
 type ArchetypeObserverCallback = types.ArchetypeObserverCallback
 type ArchetypeObserver = types.ArchetypeObserver
@@ -66,12 +67,6 @@ local PAIR_HOOK_INDEX = 1
 local RELATION_WC_HOOK_INDEX = 2
 local TARGET_WC_HOOK_INDEX = 3
 
---[[
-local BITSET_RANGE = 32
-local BITSET_PAGE_SIZE = 8
-local BITSET_MAX_ID = BITSET_RANGE * BITSET_PAGE_SIZE
-]]
-
 -- stylua: ignore start
 local ECS_WILDCARD = 		   MAX_COMPONENT_ID +  1
 local ECS_CHILDOF = 		   MAX_COMPONENT_ID +  2
@@ -89,6 +84,13 @@ local ECS_TRANSITIVE = 	   MAX_COMPONENT_ID + 13
 local ECS_DONT_FRAGMENT =    MAX_COMPONENT_ID + 14
 local ECS_REST = 			   MAX_COMPONENT_ID + 15
 -- stylua: ignore end
+
+-- Archetype signature layout (see ArchetypeMatcher). Components and the
+-- builtin ids above live in [1, BITSET_MAX_ID] and get one bit each in a u32
+-- word buffer; entities and pairs are matched through the columns map.
+local BITSET_MAX_ID = ECS_REST
+local BITSET_WORDS = (BITSET_MAX_ID + 31) // 32
+local BITSET_BYTES = BITSET_WORDS * 4
 
 local IS_COMPONENT_FLAG = bit32.lshift(1, 0)
 local IS_EXCLUSIVE_FLAG = bit32.lshift(1, 1)
@@ -199,19 +201,165 @@ local function PREREGISTER_METADATA<T>(entity: u53, id: u53, value: T?)
 	meta[id] = if value == nil then NULL_VALUE else value
 end
 
---[[
-local function SET_COMPONENT_BITSETS(component_bitsets: Map<number, Bitset>, id: number)
-	local bit = id - 1
-	local bitset_page = bit // BITSET_RANGE
-	local bit_index = bit - (bitset_page * BITSET_RANGE)
-
-	local bitset_index = bitset_page + 1
-	local bitset = component_bitsets[bitset_index] or 0
-	component_bitsets[bitset_index] = bit32.bor(bitset, bit32.lshift(1, bit_index))
-end
-]]
-
 local CHECK_FLAG = bit32.btest
+
+-------------------------------------------------------------------------------
+-- archetype signatures
+-------------------------------------------------------------------------------
+
+local band = bit32.band
+local bor = bit32.bor
+local lshift = bit32.lshift
+local readu32 = buffer.readu32
+local writeu32 = buffer.writeu32
+
+-- Two bits of a 32 bit bloom for an id outside the bitset range (entities,
+-- pairs, wildcards). Both bits depend on the low bits so pairs of one
+-- relation with neighbouring targets stay apart.
+local function BLOOM_HASH(id: u53): number
+	local low = id % 16777216
+	local high = id // 16777216
+	return bor(lshift(1, (low + high) % 32), lshift(1, (low * 7 + low // 32 + high * 3) % 32))
+end
+
+-- splits ids into (offset, mask) word pairs and a slow list, returns their
+-- bloom. slow_blooms, when given, receives the bloom of every slow id.
+local function MATCHER_COLLECT(ids: { u53 }, words: { number }, slow: { u53 }, slow_blooms: { number }?): number
+	local bloom = 0
+
+	for _, id in ids do
+		if id <= BITSET_MAX_ID then
+			local bit = id - 1
+			local offset = (bit // 32) * 4
+			local mask = lshift(1, bit % 32)
+			bloom = bor(bloom, mask)
+
+			local merged = false
+			for i = 1, #words, 2 do
+				if words[i] == offset then
+					words[i + 1] = bor(words[i + 1], mask)
+					merged = true
+					break
+				end
+			end
+			if not merged then
+				table.insert(words, offset)
+				table.insert(words, mask)
+			end
+		else
+			local hash = BLOOM_HASH(id)
+			bloom = bor(bloom, hash)
+			table.insert(slow, id)
+			if slow_blooms then
+				table.insert(slow_blooms, hash)
+			end
+		end
+	end
+
+	return bloom
+end
+
+-- placeholder signature of an archetype under construction
+local NULL_BITSET = buffer.create(0)
+
+local function ARCHETYPE_MATCHER_NEW(with_ids: { u53 }, without_ids: { u53 }?): ArchetypeMatcher
+	local with_words: { number } = {}
+	local with_slow: { u53 } = {}
+	local with_bloom = MATCHER_COLLECT(with_ids, with_words, with_slow, nil)
+
+	local without_words: { number } = NULL_ARRAY
+	local without_slow: { u53 } = NULL_ARRAY
+	local without_slow_blooms: { number } = NULL_ARRAY
+	if without_ids and #without_ids > 0 then
+		without_words = {}
+		without_slow = {}
+		without_slow_blooms = {}
+		MATCHER_COLLECT(without_ids, without_words, without_slow, without_slow_blooms)
+	end
+
+	return {
+		with_ids = with_ids,
+		without_ids = without_ids or NULL_ARRAY,
+		with_bloom = with_bloom,
+		with_words = with_words,
+		without_words = without_words,
+		with_slow = with_slow,
+		without_slow = without_slow,
+		without_slow_blooms = without_slow_blooms,
+		match = nil,
+	}
+end
+
+-- the closure form of the matcher, built once per matcher on first use.
+-- FIND_MATCHED_ARCHETYPES inlines the same checks.
+local function ARCHETYPE_MATCHER_MATCH(matcher: ArchetypeMatcher): ArchetypeMatch
+	local existing = matcher.match
+	if existing then
+		return existing
+	end
+
+	local with_bloom = matcher.with_bloom
+	local with_words = matcher.with_words
+	local with_words_count = #with_words
+	local without_words = matcher.without_words
+	local without_words_count = #without_words
+	local with_slow = matcher.with_slow
+	local with_slow_count = #with_slow
+	local without_slow = matcher.without_slow
+	local without_slow_blooms = matcher.without_slow_blooms
+	local without_slow_count = #without_slow
+
+	if with_words_count == 2 and without_words_count == 0 and with_slow_count == 0 and without_slow_count == 0 then
+		local offset = with_words[1]
+		local mask = with_words[2]
+		local function match_word(archetype: Archetype): boolean
+			return band(archetype.bloom, with_bloom) == with_bloom
+				and band(readu32(archetype.bitset, offset), mask) == mask
+		end
+		matcher.match = match_word
+		return match_word
+	end
+
+	local function match(archetype: Archetype): boolean
+		local bloom = archetype.bloom
+		if band(bloom, with_bloom) ~= with_bloom then
+			return false
+		end
+		local bitset = archetype.bitset
+		for i = 1, with_words_count, 2 do
+			local mask = with_words[i + 1]
+			if band(readu32(bitset, with_words[i]), mask) ~= mask then
+				return false
+			end
+		end
+		for i = 1, without_words_count, 2 do
+			if band(readu32(bitset, without_words[i]), without_words[i + 1]) ~= 0 then
+				return false
+			end
+		end
+		if with_slow_count > 0 then
+			local columns_map = archetype.columns_map
+			for i = 1, with_slow_count do
+				if not columns_map[with_slow[i]] then
+					return false
+				end
+			end
+		end
+		if without_slow_count > 0 then
+			local columns_map = archetype.columns_map
+			for i = 1, without_slow_count do
+				local id_bloom = without_slow_blooms[i]
+				if band(bloom, id_bloom) == id_bloom and columns_map[without_slow[i]] then
+					return false
+				end
+			end
+		end
+		return true
+	end
+
+	matcher.match = match
+	return match
+end
 
 local function INCREMENT_GENERATION(e: u53): u53
 	if e > ENTITY_MASK then
@@ -520,30 +668,8 @@ local function REMOVE_INSERTED_OBSERVERS<T>(inserted_in: { { T } }, observer: T)
 	end
 end
 
-local function MATCH_ARCHETYPE(with_ids: { number }, without_ids: { number }?, archetype: Archetype)
-	local columns_map = archetype.columns_map
-	for _, id in with_ids do
-		if not columns_map[id] then
-			return false
-		end
-	end
-	if without_ids then
-		for _, id in without_ids do
-			if columns_map[id] then
-				return false
-			end
-		end
-	end
-	return true
-end
-
--- TODO: make faster archetype matching with bitsets
-local function FIND_MATCHED_ARCHETYPES(
-	world: World,
-	with_ids: { number },
-	without_ids: { number }?,
-	ignore_empty: boolean
-)
+-- every archetype of the smallest with record that the matcher accepts
+local function FIND_MATCHED_ARCHETYPES(world: World, matcher: ArchetypeMatcher, ignore_empty: boolean)
 	local archetypes = world.archetypes
 	local components_lookup = world.components_lookup
 
@@ -551,7 +677,7 @@ local function FIND_MATCHED_ARCHETYPES(
 	local best_record_count = math.huge
 	local compatible: { Archetype } = {}
 
-	for _, id in with_ids do
+	for _, id in matcher.with_ids do
 		local record = components_lookup[id]
 		if not record then
 			continue
@@ -567,83 +693,110 @@ local function FIND_MATCHED_ARCHETYPES(
 		return compatible
 	end
 
-	if ignore_empty then
+	-- the checks of ARCHETYPE_MATCHER_MATCH, inlined to save a call per archetype
+	local with_bloom = matcher.with_bloom
+	local with_words = matcher.with_words
+	local with_words_count = #with_words
+	local without_words = matcher.without_words
+	local without_words_count = #without_words
+	local with_slow = matcher.with_slow
+	local with_slow_count = #with_slow
+	local without_slow = matcher.without_slow
+	local without_slow_blooms = matcher.without_slow_blooms
+	local without_slow_count = #without_slow
+	local has_slow = with_slow_count > 0 or without_slow_count > 0
+	local count = 0
+
+	-- a single with word and nothing else is the common shape (a few components)
+	if with_words_count == 2 and without_words_count == 0 and not has_slow then
+		local offset = with_words[1]
+		local mask = with_words[2]
 		for _, archetype_id in best_record.archetype_ids do
 			local archetype = archetypes[archetype_id]
-			if not archetype.alive then
+			if ignore_empty and not archetype.alive then
 				continue
 			end
-			local columns_map = archetype.columns_map
-			local skip = false
+			if band(archetype.bloom, with_bloom) ~= with_bloom then
+				continue
+			end
+			if band(readu32(archetype.bitset, offset), mask) ~= mask then
+				continue
+			end
+			count += 1
+			compatible[count] = archetype
+		end
+		return compatible
+	end
 
-			for _, component in with_ids do
-				if not columns_map[component] then
-					skip = true
+	for _, archetype_id in best_record.archetype_ids do
+		local archetype = archetypes[archetype_id]
+		if ignore_empty and not archetype.alive then
+			continue
+		end
+		local bloom = archetype.bloom
+		if band(bloom, with_bloom) ~= with_bloom then
+			continue
+		end
+		local bitset = archetype.bitset
+		local rejected = false
+		for i = 1, with_words_count, 2 do
+			local mask = with_words[i + 1]
+			if band(readu32(bitset, with_words[i]), mask) ~= mask then
+				rejected = true
+				break
+			end
+		end
+		if rejected then
+			continue
+		end
+		for i = 1, without_words_count, 2 do
+			if band(readu32(bitset, without_words[i]), without_words[i + 1]) ~= 0 then
+				rejected = true
+				break
+			end
+		end
+		if rejected then
+			continue
+		end
+		if has_slow then
+			local columns_map = archetype.columns_map
+			for i = 1, with_slow_count do
+				if not columns_map[with_slow[i]] then
+					rejected = true
 					break
 				end
 			end
-			if skip then
+			if rejected then
 				continue
 			end
-
-			if without_ids then
-				for _, component in without_ids do
-					if columns_map[component] then
-						skip = true
-						break
-					end
-				end
-				if skip then
-					continue
-				end
-			end
-
-			table.insert(compatible, archetype)
-		end
-	else
-		for _, archetype_id in best_record.archetype_ids do
-			local archetype = archetypes[archetype_id]
-			local columns_map = archetype.columns_map
-			local skip = false
-
-			for _, id in with_ids do
-				if not columns_map[id] then
-					skip = true
+			for i = 1, without_slow_count do
+				local id_bloom = without_slow_blooms[i]
+				if band(bloom, id_bloom) == id_bloom and columns_map[without_slow[i]] then
+					rejected = true
 					break
 				end
 			end
-			if skip then
+			if rejected then
 				continue
 			end
-
-			if without_ids then
-				for _, id in without_ids do
-					if columns_map[id] then
-						skip = true
-						break
-					end
-				end
-				if skip then
-					continue
-				end
-			end
-
-			table.insert(compatible, archetype)
 		end
+		count += 1
+		compatible[count] = archetype
 	end
 	return compatible
 end
 
-local function OBSERVE_MATCHED_ARCHETYPES(world: World, with_ids: { number }, without_ids: { number }?)
+local function OBSERVE_MATCHED_ARCHETYPES(world: World, matcher: ArchetypeMatcher)
 	local internal = world.internal
 	local archetype_creation_observers = internal.archetype_creation_observers
 	local archetype_destruction_observers = internal.archetype_destruction_observers
+	local with_ids = matcher.with_ids
 
 	if #with_ids == 0 then
 		error "cannot use a query with no terms"
 	end
 
-	local compatible_archetypes = FIND_MATCHED_ARCHETYPES(world, with_ids, without_ids, false)
+	local compatible_archetypes = FIND_MATCHED_ARCHETYPES(world, matcher, false)
 	local compatible_archetypes_map: Map<ArchetypeId, number> = {}
 
 	local observe_id = with_ids[1]
@@ -674,16 +827,13 @@ local function OBSERVE_MATCHED_ARCHETYPES(world: World, with_ids: { number }, wi
 		compatible_archetypes_map[archetype_id] = nil
 	end
 
-	local function archetype_matcher(archetype: Archetype)
-		return MATCH_ARCHETYPE(with_ids, without_ids, archetype)
-	end
-
+	local match = ARCHETYPE_MATCHER_MATCH(matcher)
 	local creation_observer: ArchetypeObserver = {
-		match = archetype_matcher,
+		match = match,
 		callback = creation_observer_callback,
 	}
 	local destruction_observer: ArchetypeObserver = {
-		match = archetype_matcher,
+		match = match,
 		callback = destruction_observer_callback,
 	}
 
@@ -788,15 +938,11 @@ local function MONITOR_ATTACH(world: World, ids: { u53 }, query_monitor: QueryId
 end
 
 -- TODO: make archetype caching optional
-local function observer_new(
-	world: World,
-	terms: { u53 },
-	with_ids: { u53 },
-	without_ids: { u53 }?,
-	callback: (entity: u53) -> ()
-)
+local function observer_new(world: World, terms: { u53 }, matcher: ArchetypeMatcher, callback: (entity: u53) -> ())
 	local component_record_ensure = world.internal.component_record_ensure
-	local _, archetypes_map, observers_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids)
+	local with_ids = matcher.with_ids
+	local without_ids: { u53 }? = if #matcher.without_ids > 0 then matcher.without_ids else nil
+	local _, archetypes_map, observers_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, matcher)
 	local last_operation_id: number? = nil
 	local fired_entities: { [u53]: boolean } = {}
 
@@ -860,8 +1006,10 @@ local function observer_new(
 end
 
 -- TODO: make archetype caching optional
-local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }?): Monitor
-	local _, archetypes_map, cache_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, with_ids, without_ids)
+local function monitor_new(world: World, matcher: ArchetypeMatcher): Monitor
+	local with_ids = matcher.with_ids
+	local without_ids: { u53 }? = if #matcher.without_ids > 0 then matcher.without_ids else nil
+	local _, archetypes_map, cache_cleanup = OBSERVE_MATCHED_ARCHETYPES(world, matcher)
 	local last_operation_id: number? = nil
 	local fired_entities: { [u53]: boolean } = {}
 
@@ -925,11 +1073,11 @@ local function monitor_new(world: World, with_ids: { u53 }, without_ids: { u53 }
 	return monitor
 end
 
-local function query_changed_new(world: World, terms: { u53 }, with_ids: { u53 }, without_ids: { u53 }?)
+local function query_changed_new(world: World, terms: { u53 }, matcher: ArchetypeMatcher)
 	local iter_queue: { u53 } = {}
 	local iter_indexes: { [u53]: number } = {}
 
-	local observer_cleanup = observer_new(world, terms, with_ids, without_ids, function(entity)
+	local observer_cleanup = observer_new(world, terms, matcher, function(entity)
 		local index = iter_indexes[entity]
 		if index then
 			return
@@ -939,7 +1087,7 @@ local function query_changed_new(world: World, terms: { u53 }, with_ids: { u53 }
 		iter_indexes[entity] = #iter_queue
 	end)
 
-	local monitor = monitor_new(world, with_ids, without_ids)
+	local monitor = monitor_new(world, matcher)
 	monitor.removed(function(entity: any)
 		local index = iter_indexes[entity]
 		if index == nil then
@@ -1011,12 +1159,23 @@ local function query_new(world: World, terms: { u53 }, with_ids: { u53 }, withou
 	return setmetatable(query, query_mt) :: any
 end
 
+-- the matcher is built from the terms on first use and reset by with/without
+local function query_matcher(query: QueryInternal): ArchetypeMatcher
+	local matcher = query.matcher
+	if matcher then
+		return matcher
+	end
+	local new_matcher = ARCHETYPE_MATCHER_NEW(query.with_ids, query.without_ids)
+	query.matcher = new_matcher
+	return new_matcher
+end
+
 local function query_match(query: QueryInternal, archetype: Archetype)
 	if query.is_cached then
 		local compatible_archetypes_map = query.compatible_archetypes_map
 		return compatible_archetypes_map[archetype.archetype_id] ~= nil
 	else
-		return MATCH_ARCHETYPE(query.with_ids, query.without_ids, archetype)
+		return ARCHETYPE_MATCHER_MATCH(query_matcher(query))(archetype)
 	end
 end
 
@@ -1029,6 +1188,7 @@ local function query_with(query: QueryInternal, ...: u53)
 	local ids = { ... }
 	local with_ids = query.with_ids
 	table.move(ids, 1, #ids, #with_ids + 1, with_ids)
+	query.matcher = nil
 	if HAS_DONT_FRAGMENT_ID(query.world, ids) then
 		setmetatable(query :: any, fallback_mt)
 	end
@@ -1047,6 +1207,7 @@ local function query_without(query: QueryInternal, ...: u53)
 	else
 		query.without_ids = ids
 	end
+	query.matcher = nil
 	if HAS_DONT_FRAGMENT_ID(query.world, ids) then
 		setmetatable(query :: any, fallback_mt)
 	end
@@ -1071,11 +1232,7 @@ local function query_rematch(query: QueryInternal)
 		return query.compatible_archetypes
 	end
 
-	local world = query.world
-	local with_ids = query.with_ids
-	local without_ids = query.without_ids
-
-	local matched = FIND_MATCHED_ARCHETYPES(world, with_ids, without_ids, true)
+	local matched = FIND_MATCHED_ARCHETYPES(query.world, query_matcher(query), true)
 	query.compatible_archetypes = matched
 	return matched
 end
@@ -2294,12 +2451,10 @@ local function query_cached(query: QueryInternal): QueryInternal
 		return query
 	end
 	query.is_cached = true
-	local with_ids = query.with_ids
-	local without_ids = query.without_ids
 
 	-- stylua: ignore
 	local compatible_archetypes, compatible_archetypes_map, cleanup = OBSERVE_MATCHED_ARCHETYPES(
-		query.world, with_ids, without_ids
+		query.world, query_matcher(query)
 	)
 	query.compatible_archetypes = compatible_archetypes
 	query.compatible_archetypes_map = compatible_archetypes_map
@@ -2309,15 +2464,15 @@ local function query_cached(query: QueryInternal): QueryInternal
 end
 
 local function query_monitor(query: QueryInternal)
-	return monitor_new(query.world, query.with_ids, query.without_ids)
+	return monitor_new(query.world, query_matcher(query))
 end
 
 local function query_observe(query: QueryInternal, callback: (entity: u53) -> ())
-	return observer_new(query.world, query.terms, query.with_ids, query.without_ids, callback)
+	return observer_new(query.world, query.terms, query_matcher(query), callback)
 end
 
 local function query_changed(query: QueryInternal)
-	return query_changed_new(query.world, query.terms, query.with_ids, query.without_ids)
+	return query_changed_new(query.world, query.terms, query_matcher(query))
 end
 
 query_mt.with = query_with
@@ -2593,6 +2748,8 @@ local function world_new()
 		components = {},
 
 		columns_map = {},
+		bitset = buffer.create(BITSET_BYTES),
+		bloom = 0,
 		exclusive_pairs = {},
 		forward_edges = {},
 		backwards_edges = {},
@@ -3362,6 +3519,9 @@ local function world_new()
 			components = ids,
 
 			columns_map = columns_map,
+			-- filled below from the ids
+			bitset = NULL_BITSET,
+			bloom = 0,
 			exclusive_pairs = exclusive_pairs,
 			forward_edges = {},
 			backwards_edges = {},
@@ -3370,6 +3530,11 @@ local function world_new()
 			traversable_count = 0,
 			traversable_ids = traversable_ids,
 		}
+
+		-- signature, see ArchetypeMatcher: a bit per id in range, the bloom
+		-- folds those bits and hashes every other key of the columns map
+		local bitset = buffer.create(BITSET_BYTES)
+		local bloom = 0
 
 		for index, id in ids do
 			local id_record = component_record_ensure(id)
@@ -3380,6 +3545,16 @@ local function world_new()
 			columns_map[id] = column
 
 			record_link_archetype(id_record, archetype_id, index)
+
+			if id <= BITSET_MAX_ID then
+				local bit = id - 1
+				local offset = (bit // 32) * 4
+				local mask = lshift(1, bit % 32)
+				writeu32(bitset, offset, bor(readu32(bitset, offset), mask))
+				bloom = bor(bloom, mask)
+			else
+				bloom = bor(bloom, BLOOM_HASH(id))
+			end
 
 			if IS_PAIR(id) then
 				local relation_wildcard = ECS_PAIR(PAIR_FIRST(id), ECS_WILDCARD)
@@ -3413,6 +3588,7 @@ local function world_new()
 				local relation_appended = archetype_append_to_pair(relation_record, archetype_id, index)
 				if relation_appended then
 					columns_map[relation_wildcard] = column
+					bloom = bor(bloom, BLOOM_HASH(relation_wildcard))
 				end
 
 				local target_record = components_lookup[target_wildcard] :: PairRecord
@@ -3420,10 +3596,13 @@ local function world_new()
 				local target_appended = archetype_append_to_pair(target_record, archetype_id, index)
 				if target_appended then
 					columns_map[target_wildcard] = column
+					bloom = bor(bloom, BLOOM_HASH(target_wildcard))
 				end
 			end
 		end
 		archetype.traversable_count = traversable_count
+		archetype.bitset = bitset
+		archetype.bloom = bloom
 		archetypes[archetype_id] = archetype
 		archetypes_lookup[hash] = archetype
 
@@ -5567,7 +5746,8 @@ local function world_new()
 		HASH_IDS = HASH_IDS,
 		REMOVE_ALL_PAIRS = REMOVE_ALL_PAIRS,
 		INSERT_COMPONENT_HOOK = INSERT_COMPONENT_HOOK,
-		MATCH_ARCHETYPE = MATCH_ARCHETYPE,
+		ARCHETYPE_MATCHER_NEW = ARCHETYPE_MATCHER_NEW,
+		ARCHETYPE_MATCHER_MATCH = ARCHETYPE_MATCHER_MATCH,
 		FIND_MATCHED_ARCHETYPES = FIND_MATCHED_ARCHETYPES,
 		OBSERVE_MATCHED_ARCHETYPES = OBSERVE_MATCHED_ARCHETYPES,
 		MONITOR_ATTACH = MONITOR_ATTACH,
