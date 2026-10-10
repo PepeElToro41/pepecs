@@ -3,6 +3,7 @@
 --!strict
 
 local engine = require "@self/engine"
+local hierarchy_new = require("@self/hierarchy").new
 local types = require "@self/types"
 
 type u24 = types.u24
@@ -44,8 +45,8 @@ export type EngineQuery = types.EngineQuery
 export type Archetype = types.Archetype
 export type EntityRecord = types.EntityRecord
 
-type ReachableElement = types.ReachableElement
-type ReachableCache = types.ReachableCache
+type Hierarchy = types.Hierarchy
+type HierarchyNode = types.HierarchyNode
 
 export type PairRecord = types.PairRecord
 export type ComponentRecord = types.ComponentRecord
@@ -93,6 +94,8 @@ local IS_TRAVERSABLE_FLAG = bit32.lshift(1, 3)
 local HAS_DELETE_FLAG = bit32.lshift(1, 2)
 
 local NULL_ARRAY = table.freeze {} :: { any }
+-- hop limit of the slow (non traversable) chain walk, matches the engine
+local MAX_TRAVERSE_DEPTH = 64
 local NULL_VALUE = newproxy()
 
 local preregistered_components_count = 0
@@ -2291,6 +2294,16 @@ local function world_new()
 		alive = 0,
 	}
 
+	local hierarchy: Hierarchy = hierarchy_new {
+		entity_index = entity_index,
+		components_lookup = components_lookup,
+		ECS_PAIR = ECS_PAIR,
+		PAIR_SECOND = PAIR_SECOND,
+		ECS_WILDCARD = ECS_WILDCARD,
+	}
+	local hierarchy_moved = hierarchy.moved
+	local hierarchy_node_release = hierarchy.node_release
+
 	local ROOT_ARCHETYPE: Archetype = {
 		archetype_id = archetypes_count,
 		hash = "",
@@ -2375,6 +2388,7 @@ local function world_new()
 				archetype = ROOT_ARCHETYPE,
 				archetype_row = -1,
 				deleting = false,
+				targets = 0,
 			}
 			table.insert(sparse_arr, new_record)
 			table.insert(dense_arr, next_id)
@@ -2404,22 +2418,6 @@ local function world_new()
 		record.dense = old_alive
 
 		entity_index.alive -= 1
-	end
-
-	local function reachable_invalidate_down(relation: u53, id: u53, record: PairRecord)
-		record.reachable.generation += 1
-
-		for _, archetype_id in record.archetype_ids do
-			local archetype = archetypes[archetype_id]
-
-			for _, entity in archetype.entities do
-				local child_id = ECS_PAIR(relation, entity :: any)
-				local child_record = components_lookup[child_id] :: PairRecord
-				if child_record then
-					reachable_invalidate_down(relation, child_id, child_record)
-				end
-			end
-		end
 	end
 
 	local function fetch(columns: { [u53]: Column }, id: u53, row: number)
@@ -2543,6 +2541,7 @@ local function world_new()
 		local is_pair = IS_PAIR(id)
 		local relation = id
 		local is_exclusive = false
+		local is_traversable = false
 		local has_delete = false
 		local target: u53? = nil
 
@@ -2574,6 +2573,7 @@ local function world_new()
 				has_delete = world_has(relation, ECS_PAIR(ECS_ON_DELETE_TARGET, ECS_DELETE))
 			end
 			is_exclusive = world_has(relation, ECS_EXCLUSIVE)
+			is_traversable = world_has(relation, ECS_TRAVERSABLE)
 
 			local pair_record = record :: PairRecord
 			pair_record.pairs_count = {}
@@ -2590,7 +2590,8 @@ local function world_new()
 		record.flags = bit32.bor(
 			(is_component and IS_COMPONENT_FLAG) or 0,
 			(has_delete and HAS_DELETE_FLAG) or 0,
-			(is_exclusive and IS_EXCLUSIVE_FLAG) or 0
+			(is_exclusive and IS_EXCLUSIVE_FLAG) or 0,
+			(is_traversable and IS_TRAVERSABLE_FLAG) or 0
 		)
 
 		components_lookup[id] = record
@@ -2681,6 +2682,7 @@ local function world_new()
 			target_record.second_records[id] = record
 			if CHECK_FLAG(relation_record.flags, IS_TRAVERSABLE_FLAG) then
 				target_record.trav_records[id] = record
+				hierarchy.node_create(record, relation_record, id)
 			end
 
 			local tgt_on_added = target_record.on_added
@@ -2873,12 +2875,18 @@ local function world_new()
 		if last_destination_row == 0 then
 			destination.alive = true
 		end
+		if record.targets > 0 then
+			hierarchy_moved(record, destination)
+		end
 	end
 
 	local function archetype_assign_entity(entity: u53, record: EntityRecord, archetype: Archetype)
 		local assigned_row = archetype_insert_entity(entity, archetype)
 		record.archetype = archetype
 		record.archetype_row = assigned_row
+		if record.targets > 0 then
+			hierarchy_moved(record, archetype)
+		end
 	end
 
 	local function archetype_delete_entity(archetype: Archetype, row: number)
@@ -3158,12 +3166,18 @@ local function world_new()
 				local record = get_entity_record(entity) :: EntityRecord
 				record.archetype = ROOT_ARCHETYPE
 				record.archetype_row = -1
+				if record.targets > 0 then
+					hierarchy_moved(record, ROOT_ARCHETYPE)
+				end
 			end
 		else
 			for row, entity in entities do
 				local record = get_entity_record(entity) :: EntityRecord
 				record.archetype = destination
 				record.archetype_row = destination_last_row + row
+				if record.targets > 0 then
+					hierarchy_moved(record, destination)
+				end
 			end
 
 			table.move(entities :: any, 1, source_last_row, destination_last_row + 1, destination_entities)
@@ -3363,16 +3377,6 @@ local function world_new()
 			archetype_move_entity(entity, record, source, destination)
 		end
 
-		--[[
-		local target_wildcard = ECS_PAIR(ECS_WILDCARD, entity)
-		local target_record = components_lookup[target_wildcard] :: PairRecord
-		if target_record then
-			for id, record in target_record.trav_records do
-				reachable_invalidate_down(PAIR_FIRST(id), id, record)
-			end
-		end
-		]]
-
 		local operation_id = current_operation_id + 1
 		current_operation_id = operation_id
 
@@ -3433,6 +3437,9 @@ local function world_new()
 			archetype_delete_entity(source, record.archetype_row)
 			record.archetype = ROOT_ARCHETYPE
 			record.archetype_row = -1
+			if record.targets > 0 then
+				hierarchy_moved(record, ROOT_ARCHETYPE)
+			end
 		else
 			archetype_move_entity(entity, record, source, destination)
 		end
@@ -3622,6 +3629,9 @@ local function world_new()
 		archetype_delete_entity(archetype, record.archetype_row)
 		record.archetype = ROOT_ARCHETYPE
 		record.archetype_row = -1
+		if record.targets > 0 then
+			hierarchy_moved(record, ROOT_ARCHETYPE)
+		end
 
 		for _, id in archetype.components do
 			local component_record = components_lookup[id]
@@ -3646,13 +3656,14 @@ local function world_new()
 		local relation_wildcard = ECS_PAIR(entity, ECS_WILDCARD)
 		local relation_record = components_lookup[relation_wildcard] :: PairRecord
 		if relation_record then
-			for pair_id in relation_record.first_records do
+			for pair_id, pair_record in relation_record.first_records do
 				local target_wildcard = ECS_PAIR(ECS_WILDCARD, PAIR_SECOND(pair_id))
 				local target_record = components_lookup[target_wildcard] :: PairRecord
 				if target_record then
 					target_record.second_records[pair_id] = nil
 					target_record.trav_records[pair_id] = nil
 				end
+				hierarchy_node_release(pair_record)
 				components_lookup[pair_id] = nil
 			end
 			components_lookup[relation_wildcard] = nil
@@ -3661,12 +3672,13 @@ local function world_new()
 		local target_wildcard = ECS_PAIR(ECS_WILDCARD, entity)
 		local target_record = components_lookup[target_wildcard] :: PairRecord
 		if target_record then
-			for pair_id in target_record.second_records do
+			for pair_id, pair_record in target_record.second_records do
 				local relation_wildcard_of_pair = ECS_PAIR(PAIR_FIRST(pair_id), ECS_WILDCARD)
 				local relation_record_of_pair = components_lookup[relation_wildcard_of_pair] :: PairRecord
 				if relation_record_of_pair then
 					relation_record_of_pair.first_records[pair_id] = nil
 				end
+				hierarchy_node_release(pair_record)
 				components_lookup[pair_id] = nil
 			end
 			components_lookup[target_wildcard] = nil
@@ -3901,6 +3913,9 @@ local function world_new()
 			archetype_delete_entity(modified_archetype, record.archetype_row)
 			record.archetype = ROOT_ARCHETYPE
 			record.archetype_row = -1
+			if record.targets > 0 then
+				hierarchy_moved(record, ROOT_ARCHETYPE)
+			end
 		end
 		record.deleting = false
 		component_records_release(entity)
@@ -4254,6 +4269,9 @@ local function world_new()
 				archetype_delete_entity(source, record.archetype_row)
 				record.archetype = ROOT_ARCHETYPE
 				record.archetype_row = -1
+				if record.targets > 0 then
+					hierarchy_moved(record, ROOT_ARCHETYPE)
+				end
 			else
 				archetype_move_entity(entity, record, source, destination)
 			end
@@ -4314,13 +4332,24 @@ local function world_new()
 		end
 
 		local archetype: Archetype = record.archetype
+		local index = component_record.column_index[archetype.archetype_id]
+		if not index then
+			return nil, nil
+		end
 
-		while true do
-			local index = component_record.column_index[archetype.archetype_id]
-			if not index then
+		-- fast path: the (R, T) node caches the nearest holder of every id
+		local pair_record = components_lookup[archetype.components[index]] :: PairRecord
+		local node = pair_record and pair_record.node
+		if node then
+			local element = hierarchy.reachable(node)[id]
+			if not element then
 				return nil, nil
 			end
+			return element.entity, element.column[element.record.archetype_row]
+		end
 
+		-- slow path: relations without the Traversable trait walk the chain
+		for _ = 1, MAX_TRAVERSE_DEPTH do
 			local target_record = get_entity_record(PAIR_SECOND(archetype.components[index])) :: EntityRecord
 			local target_archetype = target_record.archetype
 			local column = target_archetype.columns_map[id]
@@ -4329,7 +4358,57 @@ local function world_new()
 				return dense_arr[target_record.dense], column[target_record.archetype_row]
 			end
 			archetype = target_archetype
+			index = component_record.column_index[archetype.archetype_id]
+			if not index then
+				return nil, nil
+			end
 		end
+		return nil, nil
+	end
+
+	-- number of `relation` hops from the entities of `archetype` up to a root;
+	-- 0 without a pair. Every entity of an archetype shares its first pair, so
+	-- they share the depth too.
+	local function archetype_depth(archetype: Archetype, relation: u53): number
+		local relation_wildcard = ECS_PAIR(relation, ECS_WILDCARD)
+		local component_record = components_lookup[relation_wildcard]
+		if not component_record then
+			return 0
+		end
+
+		local index = component_record.column_index[archetype.archetype_id]
+		if not index then
+			return 0
+		end
+
+		local pair_record = components_lookup[archetype.components[index]] :: PairRecord
+		local node = pair_record and pair_record.node
+		if node then
+			return hierarchy.depth(node) + 1
+		end
+
+		-- slow path: walk the chain, erroring on a cycle
+		local depth = 0
+		local visited: Map<Archetype, true> = {}
+		while index do
+			depth += 1
+			local target_record = get_entity_record(PAIR_SECOND(archetype.components[index])) :: EntityRecord
+			archetype = target_record.archetype
+			if visited[archetype] then
+				error "relation cycle detected while computing depth"
+			end
+			visited[archetype] = true
+			index = component_record.column_index[archetype.archetype_id]
+		end
+		return depth
+	end
+
+	local function world_depth(entity: u53, relation: u53?): number
+		local record = get_entity_record_asserts_alive(entity)
+		if not record then
+			return 0
+		end
+		return archetype_depth(record.archetype, relation or ECS_CHILDOF)
 	end
 
 	local function world_target(entity: u53, relation: u53, index: number?): u53?
@@ -4559,6 +4638,8 @@ local function world_new()
 		MONITOR_ATTACH = MONITOR_ATTACH,
 		OBSERVER_ATTACH = OBSERVER_ATTACH,
 		monitor_new = monitor_new,
+		hierarchy = hierarchy,
+		archetype_depth = archetype_depth,
 		get_archetypes_count = function()
 			return archetypes_count
 		end,
@@ -4569,6 +4650,7 @@ local function world_new()
 		IS_PAIR = IS_PAIR,
 		ECS_WILDCARD = ECS_WILDCARD,
 		ECS_TRANSITIVE = ECS_TRANSITIVE,
+		ECS_TRAVERSABLE = ECS_TRAVERSABLE,
 		NULL_ARRAY = NULL_ARRAY,
 	}
 
@@ -4595,6 +4677,7 @@ local function world_new()
 		children = world_children,
 		target = world_target,
 		traverse = world_traverse,
+		depth = world_depth,
 		pairs = world_pairs,
 
 		add = world_add,
@@ -4721,6 +4804,7 @@ local function world_new()
 	world_set(ECS_TRANSITIVE, ECS_NAME, "ecs.Transitive")
 
 	world_add(ECS_CHILDOF, ECS_EXCLUSIVE)
+	world_add(ECS_CHILDOF, ECS_TRAVERSABLE)
 	world_add(ECS_CHILDOF, ECS_PAIR(ECS_ON_DELETE_TARGET, ECS_DELETE))
 
 	world_add(ECS_ON_DELETE, ECS_EXCLUSIVE)

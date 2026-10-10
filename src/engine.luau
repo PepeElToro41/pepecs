@@ -24,6 +24,8 @@ type Archetype = types.Archetype
 type ComponentRecord = types.ComponentRecord
 type PairRecord = types.PairRecord
 type EntityRecord = types.EntityRecord
+type HierarchyNode = types.HierarchyNode
+type ReachableElement = types.ReachableElement
 type World = types.World
 
 export type QueryBuilder = types.QueryBuilder
@@ -59,6 +61,9 @@ type BuilderInternal = {
 	pending: Term?,
 	pending_or: Term?,
 	n_out: number,
+	-- relation the results are depth sorted by (:cascade()). Not named
+	-- `cascade`: a nil field would resolve to the builder method instead.
+	cascade_relation: u53?,
 }
 
 type Prematcher = {
@@ -103,6 +108,20 @@ type QueryInternal = {
 	compatible_archetypes_map: Map<number, number>?,
 	cache_cleanup: (() -> ())?,
 	matched_generation: number,
+
+	-- :cascade(): archetypes are iterated in depth order through `cascade`.
+	-- The order is a counting sort kept in `sorted` and reused while nothing
+	-- that can change it happened: no archetype created, and for a
+	-- traversable relation no parent link changed (other relations re-sort
+	-- on every iteration since their depth is not tracked).
+	cascade: u53?,
+	cascade_tracked: boolean,
+	sorted: { Archetype }?,
+	sorted_source: { Archetype }?,
+	sorted_archetypes: number,
+	sorted_links: number,
+	-- scratch buffer of per archetype depths, reused between sorts
+	sort_depths: { number },
 
 	last_var_ent: { u53? }?,
 }
@@ -302,6 +321,22 @@ function builder_mt.transitive(builder: BuilderInternal): BuilderInternal
 	return builder
 end
 
+-- :cascade(relation) — iterate results parents first: archetypes are sorted
+-- by the depth of their entities through `relation` (roots and entities
+-- without the relation come first). Sorting only; combine with :up() to
+-- also read the term from the parent.
+function builder_mt.cascade(builder: BuilderInternal, relation: u53): BuilderInternal
+	if builder.world.internal.IS_PAIR(relation) then
+		error ":cascade() expects a relation, not a pair"
+	end
+	local existing = builder.cascade_relation
+	if existing and existing ~= relation then
+		error ":cascade() can only sort by one relation"
+	end
+	builder.cascade_relation = relation
+	return builder
+end
+
 builder_mt["self"] = function(builder: BuilderInternal): BuilderInternal
 	local term = builder_pending(builder, "self")
 	if not term.up then
@@ -314,12 +349,17 @@ end
 -- traverses up `rel_wc` from `archetype` until an archetype holding `id` is found.
 -- Returns the holder row (0 when `include_self` hit the starting archetype)
 -- and the column, or nil when nothing up the chain has `id`. Follows the first
--- target of the relation on every level and gives up after MAX_UP_DEPTH so
--- transient relation cycles cannot hang the query.
+-- target of the relation on every level.
+--
+-- Relations with the Traversable trait resolve through the hierarchy: the
+-- (R, T) record of the first pair caches the nearest holder of every id.
+-- Other relations walk the chain and give up after MAX_UP_DEPTH so transient
+-- relation cycles cannot hang the query.
 local function traverse_up(
 	components_lookup: Map<u53, ComponentRecord>,
 	sparse: Map<u24, EntityRecord>,
 	PAIR_SECOND: (u53) -> u24,
+	reachable: (HierarchyNode) -> Map<u53, ReachableElement>,
 	archetype: Archetype,
 	rel_wc: u53,
 	id: u53,
@@ -338,11 +378,22 @@ local function traverse_up(
 	end
 	local column_index = pair_record.column_index
 
-	for _ = 1, MAX_UP_DEPTH do
-		local index = column_index[archetype.archetype_id]
-		if not index then
-			return nil, nil
+	local index = column_index[archetype.archetype_id]
+	if not index then
+		return nil, nil
+	end
+
+	local first_record = components_lookup[archetype.components[index]] :: PairRecord
+	local node = first_record and first_record.node
+	if node then
+		local element = reachable(node)[id]
+		if element then
+			return element.record.archetype_row, element.column
 		end
+		return nil, nil
+	end
+
+	for _ = 1, MAX_UP_DEPTH do
 		local record = sparse[PAIR_SECOND(archetype.components[index])]
 		if not record then
 			return nil, nil
@@ -353,6 +404,10 @@ local function traverse_up(
 			return record.archetype_row, column
 		end
 		archetype = holder
+		index = column_index[archetype.archetype_id]
+		if not index then
+			return nil, nil
+		end
 	end
 
 	return nil, nil
@@ -594,6 +649,15 @@ local function compile(builder: BuilderInternal): QueryInternal
 		compatible_archetypes_map = nil,
 		cache_cleanup = nil,
 		matched_generation = -1,
+
+		cascade = builder.cascade_relation,
+		cascade_tracked = builder.cascade_relation ~= nil
+			and has(builder.cascade_relation :: u53, internal.ECS_TRAVERSABLE),
+		sorted = nil,
+		sorted_source = nil,
+		sorted_archetypes = -1,
+		sorted_links = -1,
+		sort_depths = {},
 
 		last_var_ent = nil,
 	}
@@ -1244,6 +1308,7 @@ local function iter_program(query: QueryInternal, list: { Archetype }, probe: bo
 	local ECS_PAIR = internal.ECS_PAIR
 	local PAIR_SECOND = internal.PAIR_SECOND
 	local EMPTY = internal.NULL_ARRAY
+	local reachable = internal.hierarchy.reachable
 
 	local code = query.code
 	local n_out = query.n_out
@@ -1319,6 +1384,7 @@ local function iter_program(query: QueryInternal, list: { Archetype }, probe: bo
 					components_lookup,
 					sparse,
 					PAIR_SECOND,
+					reachable,
 					var_arch[src],
 					code[off + 5],
 					code[off + 6],
@@ -1385,6 +1451,7 @@ local function iter_program(query: QueryInternal, list: { Archetype }, probe: bo
 					components_lookup,
 					sparse,
 					PAIR_SECOND,
+					reachable,
 					var_arch[code[off + 4]],
 					code[off + 5],
 					code[off + 6],
@@ -1768,6 +1835,151 @@ local function query_archetypes(query: QueryInternal): { Archetype }
 	return query_rematch(query)
 end
 
+-- Depth ordering of `list` for :cascade(). Counting sort on the archetype
+-- depth: stable, so archetypes of one depth keep their creation order.
+-- Traversable relations read the depth off the hierarchy node of the first
+-- pair; other relations walk the chain of archetypes, memoised per sort so
+-- shared ancestors are walked once.
+local function cascade_sort(query: QueryInternal, list: { Archetype }): { Archetype }
+	local world = query.world
+	local internal = world.internal
+	local archetypes_count = internal.get_archetypes_count()
+	local hierarchy = internal.hierarchy
+	local links = hierarchy.link_generation
+	local sorted = query.sorted
+
+	if
+		sorted
+		and query.sorted_source == list
+		and query.sorted_archetypes == archetypes_count
+		and (query.cascade_tracked and query.sorted_links == links)
+	then
+		return sorted
+	end
+
+	local relation = query.cascade :: u53
+	local components_lookup = world.components_lookup
+	local relation_record = components_lookup[internal.ECS_PAIR(relation, internal.ECS_WILDCARD)]
+
+	query.sorted_source = list
+	query.sorted_archetypes = archetypes_count
+	query.sorted_links = links
+
+	-- nobody holds the relation: every depth is 0 and the list is in order
+	if not relation_record then
+		query.sorted = list
+		return list
+	end
+
+	local column_index = relation_record.column_index
+	local count = #list
+	local depths = query.sort_depths
+	local max_depth = 0
+
+	if query.cascade_tracked then
+		local hierarchy_depth = hierarchy.depth
+		for index, archetype in list do
+			local depth = 0
+			local pair_index = column_index[archetype.archetype_id]
+			if pair_index then
+				local node = (components_lookup[archetype.components[pair_index]] :: PairRecord).node
+				if node then
+					local cache = node.depth
+					depth = (if cache.current == node.generation then cache.depth else hierarchy_depth(node)) + 1
+				else
+					depth = internal.archetype_depth(archetype, relation)
+				end
+			end
+			depths[index] = depth
+			if depth > max_depth then
+				max_depth = depth
+			end
+		end
+	else
+		local sparse = internal.entity_index.sparse
+		local PAIR_SECOND = internal.PAIR_SECOND
+		-- archetype id -> depth; -1 marks an archetype on the chain being walked
+		local memo: Map<number, number> = {}
+		local chain: { Archetype } = {}
+
+		for index, archetype in list do
+			local depth = memo[archetype.archetype_id]
+			if not depth then
+				local chain_count = 0
+				local base = 0
+				local current = archetype
+				while true do
+					local pair_index = column_index[current.archetype_id]
+					if not pair_index then
+						break
+					end
+					memo[current.archetype_id] = -1
+					chain_count += 1
+					chain[chain_count] = current
+
+					local target_record = sparse[PAIR_SECOND(current.components[pair_index])]
+					local holder = target_record.archetype
+					local known = memo[holder.archetype_id]
+					if known == -1 then
+						error "relation cycle detected while sorting by depth"
+					elseif known then
+						base = known
+						break
+					end
+					current = holder
+				end
+				for link = chain_count, 1, -1 do
+					base += 1
+					memo[chain[link].archetype_id] = base
+				end
+				memo[archetype.archetype_id] = base
+				depth = base
+			end
+			depths[index] = depth
+			if depth > max_depth then
+				max_depth = depth
+			end
+		end
+	end
+
+	-- bucket starts, index depth + 1
+	local starts: { number } = table.create(max_depth + 1, 0)
+	for index = 1, count do
+		local bucket = depths[index] + 1
+		starts[bucket] += 1
+	end
+	local position = 1
+	for bucket = 1, max_depth + 1 do
+		local size = starts[bucket]
+		starts[bucket] = position
+		position += size
+	end
+
+	local output: { Archetype }
+	if sorted and sorted ~= list then
+		output = sorted
+		table.clear(output)
+	else
+		output = table.create(count)
+		query.sorted = output
+	end
+	for index = 1, count do
+		local bucket = depths[index] + 1
+		local slot = starts[bucket]
+		starts[bucket] = slot + 1
+		output[slot] = list[index]
+	end
+	return output
+end
+
+local function query_archetypes_ordered(query: QueryInternal): { Archetype }
+	local list = query_archetypes(query)
+	if query.cascade and #list > 1 then
+		return cascade_sort(query, list)
+	end
+	return list
+end
+
 local function query_match(query: QueryInternal, archetype: Archetype): boolean
 	local map = query.compatible_archetypes_map
 	if map then
@@ -1777,7 +1989,7 @@ local function query_match(query: QueryInternal, archetype: Archetype): boolean
 end
 
 local function query_iter(query: QueryInternal): () -> ...any
-	local list = query_archetypes(query)
+	local list = query_archetypes_ordered(query)
 	if #list == 0 then
 		return NOOP
 	end
@@ -1848,6 +2060,7 @@ local function query_monitor(query: QueryInternal): types.Monitor
 	local archetypes = world.archetypes
 	local ECS_PAIR = internal.ECS_PAIR
 	local get_entity_record = internal.get_entity_record
+	local hierarchy_collect = internal.hierarchy.collect
 
 	local list, map, observe_cleanup = internal.OBSERVE_MATCHED_ARCHETYPES(world, prematcher.with_ids, without_ids)
 	local probe: (Archetype) -> boolean = iter_program(query, {}, true) :: any
@@ -1914,13 +2127,42 @@ local function query_monitor(query: QueryInternal): types.Monitor
 		end
 	end
 
-	-- re-evaluates every archetype holding (relation, source): all of its
-	-- entities depend on `source`. Recursion follows the chain downwards.
+	-- every archetype holding (relation, source) is re-evaluated: all of its
+	-- entities depend on `source`
+	local function reconcile_record(record: ComponentRecord)
+		local archetype_ids = record.archetype_ids
+		for index = #archetype_ids, 1, -1 do
+			local archetype_id = archetype_ids[index]
+			local archetype = if archetype_id then archetypes[archetype_id] else nil
+			if archetype and archetype.alive and map[archetype_id] then
+				reconcile_archetype(archetype)
+			end
+		end
+	end
+
+	-- re-evaluates everything that depends on `source` through `relation`,
+	-- following the chain downwards when `recursive`. Traversable relations
+	-- walk hierarchy nodes (targets only); other relations walk entities.
 	local function propagate_down(relation: u53, source: u53, recursive: boolean, depth: number)
-		local record = components_lookup[ECS_PAIR(relation, source)]
+		local record = components_lookup[ECS_PAIR(relation, source)] :: PairRecord
 		if not record then
 			return
 		end
+
+		local node = record.node
+		if node then
+			if not recursive then
+				reconcile_record(record)
+				return
+			end
+			-- snapshot first: callbacks may reshape the hierarchy while walking
+			local nodes = hierarchy_collect(node, {})
+			for _, descendant in nodes do
+				reconcile_record(descendant.record)
+			end
+			return
+		end
+
 		local archetype_ids = record.archetype_ids
 		for index = #archetype_ids, 1, -1 do
 			local archetype_id = archetype_ids[index]
@@ -2033,7 +2275,7 @@ end
 query_mt.iter = query_iter
 query_mt.__iter = query_iter
 query_mt.monitor = query_monitor
-query_mt.archetypes = query_archetypes
+query_mt.archetypes = query_archetypes_ordered
 query_mt.match = query_match
 query_mt.rematch = query_rematch
 query_mt.cached = query_cached
@@ -2052,6 +2294,7 @@ local function build(world: any): QueryBuilder
 		pending = nil,
 		pending_or = nil,
 		n_out = 0,
+		cascade_relation = nil,
 	}
 	return setmetatable(builder, builder_mt) :: any
 end

@@ -132,21 +132,71 @@ export type EntityRecord = {
 	archetype_row: number,
 	dense: u24,
 	deleting: boolean,
+	-- number of hierarchy nodes (R, this) targeting the entity. Non zero means
+	-- an archetype move has to re-hydrate those nodes.
+	targets: number,
 
 	archetype_changed: { ArchetypeChangedHook }?,
 }
 
+-------------------------------------------------------------------------------
+-- hierarchy
+-------------------------------------------------------------------------------
+
+-- The nearest holder of an id up a traversable relation. `record` is read
+-- live for the row: a swap-remove changes rows without an archetype move.
 export type ReachableElement = {
-	archetype: Archetype,
-	record: EntityRecord,
 	entity: u53,
+	record: EntityRecord,
+	column: Column,
 }
 
 export type ReachableCache = {
-	generation: number,
 	current: number,
-	cached: Map<u53, true>,
 	reachable: Map<u53, ReachableElement>,
+}
+
+export type DepthCache = {
+	current: number,
+	depth: number,
+}
+
+-- One node per (R, T) pair record whose relation R is traversable. The node
+-- mirrors T's position in the R hierarchy: parent is the node of T's first
+-- R target, children are the nodes of every entity holding (R, T). Leaves
+-- (entities that are nobody's target) never get a node.
+export type HierarchyNode = {
+	id: u53,
+	target: u24,
+	record: PairRecord,
+	relation_record: PairRecord,
+
+	parent: HierarchyNode?,
+	children: { HierarchyNode },
+	child_slots: Map<u53, number>,
+
+	-- bumped on every invalidation; caches compare their `current` to it
+	generation: number,
+	-- walk stamp, guards subtree walks against relation cycles
+	visited: number,
+
+	depth: DepthCache,
+	reachable: ReachableCache,
+}
+
+export type Hierarchy = {
+	-- bumped whenever a parent link changes; depth orderings key on it
+	link_generation: number,
+
+	node_create: (record: PairRecord, relation_record: PairRecord, id: u53) -> HierarchyNode,
+	node_release: (record: PairRecord) -> (),
+	-- re-hydrates every node targeting the entity after it changed archetype
+	moved: (record: EntityRecord, destination: Archetype) -> (),
+	invalidate: (node: HierarchyNode) -> (),
+	depth: (node: HierarchyNode) -> number,
+	reachable: (node: HierarchyNode) -> Map<u53, ReachableElement>,
+	-- appends the node and every descendant to `out`, cycle safe
+	collect: (node: HierarchyNode, out: { HierarchyNode }) -> { HierarchyNode },
 }
 
 export type PairRecord = ComponentRecord & {
@@ -160,8 +210,8 @@ export type PairRecord = ComponentRecord & {
 	-- (R, T) where R is any id with ECS_TRAVERSABLE trait
 	trav_records: Map<u53, PairRecord>,
 
-	-- To find which components are reachable through the relation
-	reachable: ReachableCache,
+	-- set on (R, T) records whose relation is traversable
+	node: HierarchyNode?,
 }
 
 export type ComponentRecord = {
@@ -264,6 +314,10 @@ export type WorldInternal = {
 	OBSERVER_ATTACH: (world: World, ids: { u53 }, observer: QueryIdObserver) -> Cleanup,
 	monitor_new: (world: World, with_ids: { u53 }, without_ids: { u53 }?) -> Monitor,
 
+	hierarchy: Hierarchy,
+	-- depth of every entity in the archetype through `relation`, 0 without a pair
+	archetype_depth: (archetype: Archetype, relation: u53) -> number,
+
 	get_archetypes_count: () -> number,
 
 	ECS_PAIR: (first: u53, second: u53) -> u53,
@@ -272,6 +326,7 @@ export type WorldInternal = {
 	IS_PAIR: (id: u53) -> boolean,
 	ECS_WILDCARD: u53,
 	ECS_TRANSITIVE: u53,
+	ECS_TRAVERSABLE: u53,
 	NULL_ARRAY: { any },
 }
 
@@ -351,6 +406,7 @@ export type World = {
 	children: (parent: Entity) -> () -> Entity,
 	target: (entity: Entity, relation: Id, index: number?) -> Entity,
 	traverse: <T>(entity: Entity, relation: Id, id: Component<T>) -> (Entity, T),
+	depth: (entity: Entity, relation: Id?) -> number,
 	pairs: (entity: Entity, relation: Id) -> () -> Entity,
 
 	add: (entity: Entity, id: Component) -> (),
@@ -435,6 +491,7 @@ export type QueryBuilder = {
 	up: (self: QueryBuilder, relation: any) -> QueryBuilder,
 	self: (self: QueryBuilder) -> QueryBuilder,
 	transitive: (self: QueryBuilder) -> QueryBuilder,
+	cascade: (self: QueryBuilder, relation: any) -> QueryBuilder,
 
 	build: (self: QueryBuilder) -> EngineQuery,
 }

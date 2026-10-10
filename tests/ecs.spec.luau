@@ -991,6 +991,355 @@ TEST("relationships", function()
 	end)
 end)
 
+-- hierarchy -------------------------------------------------------------------
+
+TEST("hierarchy", function()
+	local function node_of(world: ecs.World, relation: any, target: any)
+		local record = world.components_lookup[ecs.pair(relation, target)] :: any
+		return record and record.node
+	end
+
+	CASE("depth counts hops up ChildOf and is 0 at a root", function()
+		local world = ecs.world()
+		local root = world.entity()
+		local a = world.entity()
+		local b = world.entity()
+		local c = world.entity()
+		world.add(a, ecs.pair(ecs.ChildOf, root))
+		world.add(b, ecs.pair(ecs.ChildOf, a))
+		world.add(c, ecs.pair(ecs.ChildOf, b))
+
+		expect(world.depth(root)).to.equal(0)
+		expect(world.depth(a)).to.equal(1)
+		expect(world.depth(b)).to.equal(2)
+		expect(world.depth(c)).to.equal(3)
+		expect(world.depth(c, ecs.ChildOf)).to.equal(3)
+		expect(world.depth(world.entity())).to.equal(0)
+	end)
+
+	CASE("depth follows reparenting, pair removal and parent deletion", function()
+		local world = ecs.world()
+		local root = world.entity()
+		local a = world.entity()
+		local b = world.entity()
+		local c = world.entity()
+		world.add(a, ecs.pair(ecs.ChildOf, root))
+		world.add(b, ecs.pair(ecs.ChildOf, a))
+		world.add(c, ecs.pair(ecs.ChildOf, b))
+		expect(world.depth(c)).to.equal(3)
+
+		-- reparent the middle of the chain: the subtree below shifts
+		world.add(b, ecs.pair(ecs.ChildOf, root))
+		expect(world.depth(b)).to.equal(1)
+		expect(world.depth(c)).to.equal(2)
+
+		-- removing the pair makes b a root
+		world.remove(b, ecs.pair(ecs.ChildOf, root))
+		expect(world.depth(b)).to.equal(0)
+		expect(world.depth(c)).to.equal(1)
+
+		-- re-attach deeper and then delete an ancestor: ChildOf cascades
+		world.add(b, ecs.pair(ecs.ChildOf, a))
+		expect(world.depth(c)).to.equal(3)
+		world.delete(a)
+		expect(world.alive(c)).to.equal(false)
+		expect(world.depth(root)).to.equal(0)
+	end)
+
+	CASE("depth works through a custom traversable relation and the slow path", function()
+		local world = ecs.world()
+		local Trav = world.tag()
+		world.add(Trav, ecs.Traversable)
+		local Plain = world.tag()
+
+		local root = world.entity()
+		local a = world.entity()
+		local b = world.entity()
+		for _, R in { Trav, Plain } do
+			world.add(a, ecs.pair(R, root))
+			world.add(b, ecs.pair(R, a))
+		end
+
+		expect(node_of(world, Trav, root)).never.to.beNil()
+		expect(node_of(world, Plain, root)).to.beNil()
+
+		expect(world.depth(b, Trav)).to.equal(2)
+		expect(world.depth(b, Plain)).to.equal(2)
+
+		-- no cascade on a plain relation: removing the target's pair re-roots it
+		world.remove(a, ecs.pair(Trav, root))
+		world.remove(a, ecs.pair(Plain, root))
+		expect(world.depth(b, Trav)).to.equal(1)
+		expect(world.depth(b, Plain)).to.equal(1)
+
+		-- deleting the target removes the pair from its holders
+		world.delete(a)
+		expect(world.depth(b, Trav)).to.equal(0)
+		expect(world.depth(b, Plain)).to.equal(0)
+	end)
+
+	CASE("depth errors on a relation cycle, on both paths", function()
+		local world = ecs.world()
+		local a = world.entity()
+		local b = world.entity()
+		world.add(a, ecs.pair(ecs.ChildOf, b))
+		world.add(b, ecs.pair(ecs.ChildOf, a))
+		expect(function()
+			world.depth(a)
+		end).to.throw "cycle"
+
+		local Plain = world.tag()
+		local c = world.entity()
+		local d = world.entity()
+		world.add(c, ecs.pair(Plain, d))
+		world.add(d, ecs.pair(Plain, c))
+		expect(function()
+			world.depth(c, Plain)
+		end).to.throw "cycle"
+
+		-- breaking the cycle recovers
+		world.remove(b, ecs.pair(ecs.ChildOf, a))
+		expect(world.depth(a)).to.equal(1)
+		expect(world.depth(b)).to.equal(0)
+	end)
+
+	CASE("nodes mirror parent and children links and are released on delete", function()
+		local world = ecs.world()
+		local root = world.entity()
+		local a = world.entity()
+		local b = world.entity()
+		local leaf = world.entity()
+		world.add(a, ecs.pair(ecs.ChildOf, root))
+		world.add(b, ecs.pair(ecs.ChildOf, root))
+		world.add(leaf, ecs.pair(ecs.ChildOf, a))
+
+		local root_node = node_of(world, ecs.ChildOf, root)
+		local a_node = node_of(world, ecs.ChildOf, a)
+		expect(root_node.parent).to.beNil()
+		expect(a_node.parent).to.equal(root_node)
+		expect(#root_node.children).to.equal(1)
+		expect(root_node.children[1]).to.equal(a_node)
+		-- leaves are nobody's target: no node, no bookkeeping
+		expect(node_of(world, ecs.ChildOf, leaf)).to.beNil()
+		expect(node_of(world, ecs.ChildOf, b)).to.beNil()
+
+		local sparse = world.internal.entity_index.sparse
+		expect(sparse[a].targets).to.equal(1)
+		expect(sparse[leaf].targets).to.equal(0)
+
+		-- a becomes a child of b: b gets a node, a relinks
+		world.add(a, ecs.pair(ecs.ChildOf, b))
+		local b_node = node_of(world, ecs.ChildOf, b)
+		expect(a_node.parent).to.equal(b_node)
+		expect(b_node.parent).to.equal(root_node)
+		expect(#root_node.children).to.equal(1)
+		expect(root_node.children[1]).to.equal(b_node)
+		expect(#b_node.children).to.equal(1)
+
+		-- deleting a cascades to leaf and releases a's node
+		world.delete(a)
+		expect(#b_node.children).to.equal(0)
+		expect(node_of(world, ecs.ChildOf, a)).to.beNil()
+		expect(sparse[a].targets).to.equal(0)
+	end)
+
+	CASE("traverse resolves through the reachable cache and follows every change", function()
+		local world = ecs.world()
+		local C = world.component()
+		local D = world.component()
+		local root = world.entity()
+		local a = world.entity()
+		local b = world.entity()
+		local leaf = world.entity()
+		world.add(a, ecs.pair(ecs.ChildOf, root))
+		world.add(b, ecs.pair(ecs.ChildOf, a))
+		world.add(leaf, ecs.pair(ecs.ChildOf, b))
+		world.set(root, C, "root")
+
+		expect(world.traverse(leaf, ecs.ChildOf, C)).to.equal(root)
+		expect(world.traverse(leaf, ecs.ChildOf, D)).to.beNil()
+		local b_node = node_of(world, ecs.ChildOf, b)
+		expect(b_node.reachable.current).to.equal(b_node.generation)
+
+		-- a closer holder appears: cache invalidated and re-resolved
+		world.set(a, C, "a")
+		expect(b_node.reachable.current).never.to.equal(b_node.generation)
+		local found, value = world.traverse(leaf, ecs.ChildOf, C)
+		expect(found).to.equal(a)
+		expect(value).to.equal "a"
+
+		-- value changes without a move are read live
+		world.set(a, C, "a2")
+		expect(select(2, world.traverse(leaf, ecs.ChildOf, C))).to.equal "a2"
+
+		-- holder loses it: falls back to the next one up
+		world.remove(a, C)
+		expect(world.traverse(leaf, ecs.ChildOf, C)).to.equal(root)
+
+		-- reparenting b under a sibling branch without C
+		local other = world.entity()
+		world.add(b, ecs.pair(ecs.ChildOf, other))
+		expect(world.traverse(leaf, ecs.ChildOf, C)).to.beNil()
+		world.set(other, D, 1)
+		local found_d, value_d = world.traverse(leaf, ecs.ChildOf, D)
+		expect(found_d).to.equal(other)
+		expect(value_d).to.equal(1)
+
+		-- the holder of the cached column changes row through a swap-remove
+		local sibling = world.entity()
+		world.set(sibling, D, 2)
+		world.delete(sibling)
+		expect(select(2, world.traverse(leaf, ecs.ChildOf, D))).to.equal(1)
+		world.set(other, D, 3)
+		expect(select(2, world.traverse(leaf, ecs.ChildOf, D))).to.equal(3)
+	end)
+
+	CASE("traverse survives bulk operations, clear, wipe and ancestor deletion", function()
+		local world = ecs.world()
+		local C = world.component()
+		local D = world.component()
+		local root = world.entity()
+		local a = world.entity()
+		local leaf = world.entity()
+		world.add(a, ecs.pair(ecs.ChildOf, root))
+		world.add(leaf, ecs.pair(ecs.ChildOf, a))
+
+		world.bulk_set(root, { C, D }, { "rc", "rd" })
+		expect(select(2, world.traverse(leaf, ecs.ChildOf, C))).to.equal "rc"
+		world.bulk_set(a, { C }, { "ac" })
+		expect(select(2, world.traverse(leaf, ecs.ChildOf, C))).to.equal "ac"
+		expect(select(2, world.traverse(leaf, ecs.ChildOf, D))).to.equal "rd"
+
+		world.bulk_remove(a, { C })
+		expect(select(2, world.traverse(leaf, ecs.ChildOf, C))).to.equal "rc"
+
+		world.clear(root)
+		expect(world.traverse(leaf, ecs.ChildOf, C)).to.beNil()
+
+		world.set(root, C, "rc2")
+		world.set(a, C, "ac2")
+		world.wipe(C)
+		expect(world.traverse(leaf, ecs.ChildOf, C)).to.beNil()
+
+		-- a custom traversable relation without cascade: deleting the middle
+		-- re-roots the holder
+		local Trav = world.tag()
+		world.add(Trav, ecs.Traversable)
+		local top = world.entity()
+		local mid = world.entity()
+		local bottom = world.entity()
+		world.set(top, C, "top")
+		world.add(mid, ecs.pair(Trav, top))
+		world.add(bottom, ecs.pair(Trav, mid))
+		expect(world.traverse(bottom, Trav, C)).to.equal(top)
+		world.delete(mid)
+		expect(world.traverse(bottom, Trav, C)).to.beNil()
+		expect(world.depth(bottom, Trav)).to.equal(0)
+	end)
+
+	CASE("invalidation only walks nodes and keeps unrelated branches valid", function()
+		local world = ecs.world()
+		local C = world.component()
+		local root = world.entity()
+		local a = world.entity()
+		local b = world.entity()
+		local a_child = world.entity()
+		local b_child = world.entity()
+		world.add(a, ecs.pair(ecs.ChildOf, root))
+		world.add(b, ecs.pair(ecs.ChildOf, root))
+		world.add(a_child, ecs.pair(ecs.ChildOf, a))
+		world.add(b_child, ecs.pair(ecs.ChildOf, b))
+		world.set(root, C, 1)
+
+		expect(world.traverse(a_child, ecs.ChildOf, C)).to.equal(root)
+		expect(world.traverse(b_child, ecs.ChildOf, C)).to.equal(root)
+		local a_node = node_of(world, ecs.ChildOf, a)
+		local b_node = node_of(world, ecs.ChildOf, b)
+		expect(world.depth(a_child)).to.equal(2)
+		expect(a_node.depth.current).to.equal(a_node.generation)
+
+		-- touching a invalidates a's subtree only
+		world.set(a, C, 2)
+		expect(a_node.reachable.current).never.to.equal(a_node.generation)
+		expect(a_node.depth.current).never.to.equal(a_node.generation)
+		expect(b_node.reachable.current).to.equal(b_node.generation)
+
+		-- setting a value root already holds is not a move: nothing invalidates
+		world.set(root, C, 3)
+		expect(b_node.reachable.current).to.equal(b_node.generation)
+		expect(select(2, world.traverse(b_child, ecs.ChildOf, C))).to.equal(3)
+
+		-- moving root invalidates every node below
+		world.add(root, world.tag())
+		expect(b_node.reachable.current).never.to.equal(b_node.generation)
+		expect(select(2, world.traverse(b_child, ecs.ChildOf, C))).to.equal(3)
+		expect(select(2, world.traverse(a_child, ecs.ChildOf, C))).to.equal(2)
+	end)
+
+	CASE("up queries read through the cache and see reparenting and deletion", function()
+		local world = ecs.world()
+		local Model = world.component()
+		local Tag = world.tag()
+		local root = world.entity()
+		local a = world.entity()
+		local b = world.entity()
+		local leaf = world.entity()
+		world.set(root, Model, "root")
+		world.add(a, ecs.pair(ecs.ChildOf, root))
+		world.add(b, ecs.pair(ecs.ChildOf, a))
+		world.add(leaf, ecs.pair(ecs.ChildOf, b))
+		world.add(leaf, Tag)
+
+		local query = world.query_build():with(Tag):term(Model):up(ecs.ChildOf):build()
+		local function read()
+			local seen = {}
+			for entity, model in query do
+				seen[entity] = model
+			end
+			return seen
+		end
+
+		expect(read()).to.equal { [leaf] = "root" }
+		world.set(a, Model, "a")
+		expect(read()).to.equal { [leaf] = "a" }
+		world.add(b, ecs.pair(ecs.ChildOf, root))
+		expect(read()).to.equal { [leaf] = "root" }
+		world.remove(root, Model)
+		expect(read()).to.equal {}
+		world.set(b, Model, "b")
+		expect(read()).to.equal { [leaf] = "b" }
+
+		-- deleting an ancestor cascades: nothing is left to match
+		world.delete(root)
+		expect(read()).to.equal {}
+	end)
+
+	CASE("up monitors propagate through nodes to grandchildren", function()
+		local world = ecs.world()
+		local Position = world.component()
+		local root = world.entity()
+		local a = world.entity()
+		local leaf = world.entity()
+		world.add(a, ecs.pair(ecs.ChildOf, root))
+		world.add(leaf, ecs.pair(ecs.ChildOf, a))
+
+		local monitor = world.query_build():term(Position):up(ecs.ChildOf):build():monitor()
+		local added, removed = {}, {}
+		monitor.added(function(entity)
+			table.insert(added, entity)
+		end)
+		monitor.removed(function(entity)
+			table.insert(removed, entity)
+		end)
+
+		world.set(root, Position, 1)
+		expect(sorted(added)).to.equal(sorted { a, leaf })
+		world.remove(root, Position)
+		expect(sorted(removed)).to.equal(sorted { a, leaf })
+		monitor.cleanup()
+	end)
+end)
+
 -- deletion cascades -------------------------------------------------------------------
 
 TEST("deletion cascades", function()
@@ -3884,6 +4233,199 @@ TEST("query engine", function()
 		expect(function()
 			world.query_build():term(A):target "v"
 		end).to.throw "$variable"
+	end)
+end)
+
+TEST("query cascade", function()
+	-- yields every entity of the query with its ChildOf depth, in order
+	local function depths(world: ecs.World, query: any, relation: any): ({ any }, { number })
+		local entities, out = {}, {}
+		for entity in query do
+			table.insert(entities, entity)
+			table.insert(out, world.depth(entity, relation))
+		end
+		return entities, out
+	end
+
+	local function is_sorted(list: { number }): boolean
+		for i = 2, #list do
+			if list[i] < list[i - 1] then
+				return false
+			end
+		end
+		return true
+	end
+
+	-- root (no pair) -> a, b -> a1, a2, b1 -> a1x; every entity carries Tag
+	local function tree(world: ecs.World, Tag: any)
+		local t = {}
+		t.root = world.entity()
+		t.a = world.entity()
+		t.b = world.entity()
+		t.a1 = world.entity()
+		t.a2 = world.entity()
+		t.b1 = world.entity()
+		t.a1x = world.entity()
+		for _, e in { t.root, t.a, t.b, t.a1, t.a2, t.b1, t.a1x } do
+			world.add(e, Tag)
+		end
+		world.add(t.a, ecs.pair(ecs.ChildOf, t.root))
+		world.add(t.b, ecs.pair(ecs.ChildOf, t.root))
+		world.add(t.a1, ecs.pair(ecs.ChildOf, t.a))
+		world.add(t.a2, ecs.pair(ecs.ChildOf, t.a))
+		world.add(t.b1, ecs.pair(ecs.ChildOf, t.b))
+		world.add(t.a1x, ecs.pair(ecs.ChildOf, t.a1))
+		return t
+	end
+
+	CASE("results come parents first, roots and entities without the relation at the front", function()
+		local world = ecs.world()
+		local Tag = world.tag()
+		local t = tree(world, Tag)
+		local loose = world.entity()
+		world.add(loose, Tag)
+
+		local query = world.query_build():term(Tag):cascade(ecs.ChildOf):build()
+		expect(query.is_static).to.equal(true)
+
+		local entities, order = depths(world, query, ecs.ChildOf)
+		expect(#entities).to.equal(8)
+		expect(order).to.equal { 0, 0, 1, 1, 2, 2, 2, 3 }
+		expect(entities[8]).to.equal(t.a1x)
+		-- same depth keeps archetype creation order: (ChildOf, a) before
+		-- (ChildOf, b). Rows inside one archetype iterate in reverse as usual.
+		expect(sorted { entities[5], entities[6] }).to.equal(sorted { t.a1, t.a2 })
+		expect(entities[7]).to.equal(t.b1)
+
+		-- archetypes() exposes the same order
+		local seen_depth = -1
+		for _, archetype in query:archetypes() do
+			local depth = world.internal.archetype_depth(archetype, ecs.ChildOf)
+			expect(depth >= seen_depth).to.equal(true)
+			seen_depth = depth
+		end
+	end)
+
+	CASE("reparenting re-sorts cached and uncached queries, order is reused otherwise", function()
+		local world = ecs.world()
+		local Tag = world.tag()
+		local t = tree(world, Tag)
+
+		local uncached = world.query_build():term(Tag):cascade(ecs.ChildOf):build()
+		local cached = world.query_build():term(Tag):cascade(ecs.ChildOf):build():cached()
+
+		local first = cached:archetypes()
+		expect(cached:archetypes()).to.equal(first)
+		-- same table reused while nothing changed
+		expect(rawequal(cached:archetypes(), first)).to.equal(true)
+
+		-- b moves under a1x: b is now depth 4 and b1 depth 5
+		world.add(t.b, ecs.pair(ecs.ChildOf, t.a1x))
+		for _, query in { uncached, cached } do
+			local entities, order = depths(world, query, ecs.ChildOf)
+			expect(is_sorted(order)).to.equal(true)
+			expect(order[#order]).to.equal(5)
+			expect(entities[#entities]).to.equal(t.b1)
+			expect(entities[#entities - 1]).to.equal(t.b)
+		end
+
+		-- a new archetype lands at its depth: a child of root with an extra component
+		local Extra = world.component()
+		local c = world.entity()
+		world.add(c, Tag)
+		world.set(c, Extra, 1)
+		world.add(c, ecs.pair(ecs.ChildOf, t.root))
+		for _, query in { uncached, cached } do
+			local entities, order = depths(world, query, ecs.ChildOf)
+			expect(is_sorted(order)).to.equal(true)
+			expect(table.find(entities, c)).to.equal(3)
+		end
+
+		-- deleting a subtree keeps the rest ordered
+		world.delete(t.a)
+		for _, query in { uncached, cached } do
+			local entities, order = depths(world, query, ecs.ChildOf)
+			expect(is_sorted(order)).to.equal(true)
+			expect(entities).to.equal { t.root, c }
+		end
+		cached:cleanup()
+	end)
+
+	CASE("world transforms propagate in one pass with :up()", function()
+		local world = ecs.world()
+		local Local = world.component()
+		local World = world.component()
+		local t = tree(world, world.tag())
+		local all = { t.root, t.a, t.b, t.a1, t.a2, t.b1, t.a1x }
+		for index, e in all do
+			world.set(e, Local, index)
+			world.set(e, World, 0)
+		end
+
+		local query = world
+			.query_build()
+			:term(Local)
+			:term(World)
+			:term(World)
+			:up(ecs.ChildOf)
+			:optional()
+			:cascade(ecs.ChildOf)
+			:build()
+		expect(query.is_static).to.equal(false)
+
+		for e, local_value, _, parent_world in query do
+			world.set(e, World, (parent_world or 0) + local_value)
+		end
+
+		expect(world.get(t.root, World)).to.equal(1)
+		expect(world.get(t.a, World)).to.equal(1 + 2)
+		expect(world.get(t.b, World)).to.equal(1 + 3)
+		expect(world.get(t.a1, World)).to.equal(1 + 2 + 4)
+		expect(world.get(t.a2, World)).to.equal(1 + 2 + 5)
+		expect(world.get(t.b1, World)).to.equal(1 + 3 + 6)
+		expect(world.get(t.a1x, World)).to.equal(1 + 2 + 4 + 7)
+	end)
+
+	CASE("non traversable relations are sorted too and re-sort every iteration", function()
+		local world = ecs.world()
+		local Plain = world.tag()
+		local Tag = world.tag()
+		local root = world.entity()
+		local a = world.entity()
+		local b = world.entity()
+		for _, e in { root, a, b } do
+			world.add(e, Tag)
+		end
+		world.add(b, ecs.pair(Plain, root))
+		world.add(a, ecs.pair(Plain, b))
+
+		local query = world.query_build():term(Tag):cascade(Plain):build():cached()
+		local entities = depths(world, query, Plain)
+		expect(entities).to.equal { root, b, a }
+
+		-- swap the chain without creating archetypes: b under a, a under root
+		world.add(a, ecs.pair(Plain, root))
+		world.add(b, ecs.pair(Plain, a))
+		entities = depths(world, query, Plain)
+		expect(entities).to.equal { root, a, b }
+		query:cleanup()
+	end)
+
+	CASE("builder errors", function()
+		local world = ecs.world()
+		local A = world.component()
+		local R = world.tag()
+		local T = world.entity()
+		expect(function()
+			world.query_build():term(A):cascade(ecs.pair(R, T))
+		end).to.throw "relation"
+		expect(function()
+			world.query_build():term(A):cascade(ecs.ChildOf):cascade(R)
+		end).to.throw "one relation"
+		-- the modifier is query wide, so it may come before the terms
+		expect(function()
+			world.query_build():cascade(ecs.ChildOf):term(A):build()
+		end).never.to.throw()
 	end)
 end)
 
